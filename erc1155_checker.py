@@ -24,9 +24,9 @@ def connect_to_polygon():
     return w3
 
 def get_contract(w3, contract_address, abi):
-    """Get the contract object for the given address and ABI."""
+    """Retrieve the contract object using the provided contract address and ABI."""
     try:
-        contract = w3.eth.contract(address=contract_address, abi=abi)
+        contract = w3.eth.contract(address=Web3.toChecksumAddress(contract_address), abi=abi)
         logging.info(f"Contract loaded at address: {contract_address}")
         return contract
     except Exception as e:
@@ -34,13 +34,14 @@ def get_contract(w3, contract_address, abi):
         raise
 
 def get_erc1155_tokens(contract, address, token_ids):
-    """Fetch the balances of specified ERC1155 token IDs for a given address."""
+    """Fetch ERC1155 token balances for the specified address and token IDs."""
     tokens = []
     try:
         for token_id in token_ids:
-            balance = contract.functions.balanceOf(address, token_id).call()
+            balance = contract.functions.balanceOf(Web3.toChecksumAddress(address), token_id).call()
             if balance > 0:
                 tokens.append((token_id, balance))
+                logging.info(f"Token ID: {token_id}, Balance: {balance} found for address: {address}")
     except Exception as e:
         logging.error(f"Error fetching tokens for address {address}: {e}")
     return tokens
@@ -52,35 +53,31 @@ def read_wallet_addresses(file_path):
         raise FileNotFoundError(f"{file_path} not found.")
     
     with open(file_path, 'r') as file:
-        wallet_addresses = [line.strip() for line in file]
+        wallet_addresses = [line.strip() for line in file if line.strip()]
         logging.info(f"Loaded {len(wallet_addresses)} wallet addresses.")
     
     return wallet_addresses
 
 def write_token_data(outfile_path, wallet, tokens):
-    """Write the fetched token data to a file."""
+    """Write token balances to an output file."""
     with open(outfile_path, 'a') as outfile:
+        outfile.write(f'Address: {wallet}\n')
         if tokens:
-            outfile.write(f'Address: {wallet}\n')
             for token_id, balance in tokens:
                 outfile.write(f'  Token ID: {token_id}, Balance: {balance}\n')
         else:
-            outfile.write(f'Address: {wallet} has no ERC1155 tokens\n')
+            outfile.write(f'  No ERC1155 tokens found.\n')
+    logging.info(f"Token data written for address: {wallet}")
 
-def main(contract_address, token_ids, wallet_addresses_file, output_file):
-    """Main function to execute the script."""
+def main(contract_address, token_ids, wallet_addresses_file, output_file, abi):
+    """Main function to execute the ERC1155 balance check."""
     w3 = connect_to_polygon()
-    contract = get_contract(w3, contract_address, ERC1155_ABI)
+    contract = get_contract(w3, contract_address, abi)
     
     wallet_addresses = read_wallet_addresses(wallet_addresses_file)
     
     for wallet in wallet_addresses:
         tokens = get_erc1155_tokens(contract, wallet, token_ids)
-        if tokens:
-            logging.info(f'Tokens found for address {wallet}')
-        else:
-            logging.info(f'No tokens found for address {wallet}')
-        
         write_token_data(output_file, wallet, tokens)
 
     logging.info('Processing completed.')
@@ -96,10 +93,16 @@ if __name__ == "__main__":
                         help='Path to the file containing wallet addresses.')
     parser.add_argument('--output', type=str, default='wallet_tokens.txt', 
                         help='Path to the output file for storing token balances.')
+    parser.add_argument('--abi', type=str, required=True, 
+                        help='Path to the ABI JSON file for the ERC1155 contract.')
 
     args = parser.parse_args()
 
     if args.contract == '0xYourERC1155ContractAddress':
         logging.warning("Using default contract address. Please set ERC1155_CONTRACT_ADDRESS in the .env file.")
 
-    main(args.contract, args.tokens, args.wallets, args.output)
+    # Load ABI from file
+    with open(args.abi, 'r') as abi_file:
+        abi = json.load(abi_file)
+
+    main(args.contract, args.tokens, args.wallets, args.output, abi)

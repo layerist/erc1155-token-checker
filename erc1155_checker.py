@@ -102,7 +102,14 @@ if __name__ == "__main__":
         logging.warning("Using default contract address. Please set ERC1155_CONTRACT_ADDRESS in the .env file.")
 
     # Load ABI from file
-    with open(args.abi, 'r') as abi_file:
-        abi = json.load(abi_file)
+    try:
+        with open(args.abi, 'r') as abi_file:
+            abi = json.load(abi_file)
+    except FileNotFoundError:
+        logging.error(f"ABI file not found: {args.abi}")
+        exit(1)
+    except json.JSONDecodeError:
+        logging.error(f"Failed to decode ABI JSON: {args.abi}")
+        exit(1)
 
     main(args.contract, args.tokens, args.wallets, args.output, abi)

@@ -23,6 +23,20 @@ def connect_to_polygon():
     logging.info("Successfully connected to the Polygon network.")
     return w3
 
+def load_abi(abi_path):
+    """Load the ABI JSON from the specified file."""
+    try:
+        with open(abi_path, 'r') as abi_file:
+            abi = json.load(abi_file)
+        logging.info(f"ABI successfully loaded from {abi_path}")
+        return abi
+    except FileNotFoundError:
+        logging.error(f"ABI file not found: {abi_path}")
+        raise
+    except json.JSONDecodeError:
+        logging.error(f"Invalid ABI JSON format in file: {abi_path}")
+        raise
+
 def get_contract(w3, contract_address, abi):
     """Retrieve the contract object using the provided contract address and ABI."""
     try:
@@ -33,17 +47,18 @@ def get_contract(w3, contract_address, abi):
         logging.error(f"Failed to load contract: {e}")
         raise
 
-def get_erc1155_tokens(contract, address, token_ids):
-    """Fetch ERC1155 token balances for the specified address and token IDs."""
+def get_erc1155_tokens(contract, wallet_address, token_ids):
+    """Fetch ERC1155 token balances for the specified wallet and token IDs."""
     tokens = []
     try:
+        wallet_address = Web3.toChecksumAddress(wallet_address)
         for token_id in token_ids:
-            balance = contract.functions.balanceOf(Web3.toChecksumAddress(address), token_id).call()
+            balance = contract.functions.balanceOf(wallet_address, token_id).call()
             if balance > 0:
                 tokens.append((token_id, balance))
-                logging.info(f"Token ID: {token_id}, Balance: {balance} found for address: {address}")
+                logging.info(f"Token ID: {token_id}, Balance: {balance} for address: {wallet_address}")
     except Exception as e:
-        logging.error(f"Error fetching tokens for address {address}: {e}")
+        logging.error(f"Error fetching tokens for address {wallet_address}: {e}")
     return tokens
 
 def read_wallet_addresses(file_path):
@@ -69,11 +84,11 @@ def write_token_data(outfile_path, wallet, tokens):
             outfile.write(f'  No ERC1155 tokens found.\n')
     logging.info(f"Token data written for address: {wallet}")
 
-def main(contract_address, token_ids, wallet_addresses_file, output_file, abi):
+def main(contract_address, token_ids, wallet_addresses_file, output_file, abi_path):
     """Main function to execute the ERC1155 balance check."""
     w3 = connect_to_polygon()
+    abi = load_abi(abi_path)
     contract = get_contract(w3, contract_address, abi)
-    
     wallet_addresses = read_wallet_addresses(wallet_addresses_file)
     
     for wallet in wallet_addresses:
@@ -85,9 +100,9 @@ def main(contract_address, token_ids, wallet_addresses_file, output_file, abi):
 if __name__ == "__main__":
     # Argument parser for command line execution
     parser = argparse.ArgumentParser(description="Fetch ERC1155 token balances for a list of wallet addresses.")
-    parser.add_argument('--contract', type=str, default=os.getenv('ERC1155_CONTRACT_ADDRESS', '0xYourERC1155ContractAddress'), 
+    parser.add_argument('--contract', type=str, required=True, 
                         help='The ERC1155 contract address.')
-    parser.add_argument('--tokens', type=int, nargs='+', default=[1, 2, 3, 4, 5], 
+    parser.add_argument('--tokens', type=int, nargs='+', required=True, 
                         help='List of token IDs to check.')
     parser.add_argument('--wallets', type=str, default='wallet_addresses.txt', 
                         help='Path to the file containing wallet addresses.')
@@ -98,18 +113,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.contract == '0xYourERC1155ContractAddress':
-        logging.warning("Using default contract address. Please set ERC1155_CONTRACT_ADDRESS in the .env file.")
-
-    # Load ABI from file
     try:
-        with open(args.abi, 'r') as abi_file:
-            abi = json.load(abi_file)
-    except FileNotFoundError:
-        logging.error(f"ABI file not found: {args.abi}")
+        main(args.contract, args.tokens, args.wallets, args.output, args.abi)
+    except Exception as e:
+        logging.error(f"Error in execution: {e}")
         exit(1)
-    except json.JSONDecodeError:
-        logging.error(f"Failed to decode ABI JSON: {args.abi}")
-        exit(1)
-
-    main(args.contract, args.tokens, args.wallets, args.output, abi)

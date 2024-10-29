@@ -1,9 +1,9 @@
 import json
 import os
-from web3 import Web3
-from dotenv import load_dotenv
 import logging
 import argparse
+from web3 import Web3
+from dotenv import load_dotenv
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,14 +25,15 @@ def connect_to_polygon():
 
 def load_abi(abi_path):
     """Load the ABI JSON from the specified file."""
+    if not os.path.exists(abi_path):
+        logging.error(f"ABI file not found: {abi_path}")
+        raise FileNotFoundError(f"ABI file not found: {abi_path}")
+        
     try:
         with open(abi_path, 'r') as abi_file:
             abi = json.load(abi_file)
         logging.info(f"ABI successfully loaded from {abi_path}")
         return abi
-    except FileNotFoundError:
-        logging.error(f"ABI file not found: {abi_path}")
-        raise
     except json.JSONDecodeError:
         logging.error(f"Invalid ABI JSON format in file: {abi_path}")
         raise
@@ -50,22 +51,22 @@ def get_contract(w3, contract_address, abi):
 def get_erc1155_tokens(contract, wallet_address, token_ids):
     """Fetch ERC1155 token balances for the specified wallet and token IDs."""
     tokens = []
-    try:
-        wallet_address = Web3.toChecksumAddress(wallet_address)
-        for token_id in token_ids:
+    wallet_address = Web3.toChecksumAddress(wallet_address)
+    for token_id in token_ids:
+        try:
             balance = contract.functions.balanceOf(wallet_address, token_id).call()
             if balance > 0:
                 tokens.append((token_id, balance))
                 logging.info(f"Token ID: {token_id}, Balance: {balance} for address: {wallet_address}")
-    except Exception as e:
-        logging.error(f"Error fetching tokens for address {wallet_address}: {e}")
+        except Exception as e:
+            logging.error(f"Error fetching token {token_id} for address {wallet_address}: {e}")
     return tokens
 
 def read_wallet_addresses(file_path):
     """Read wallet addresses from a file."""
     if not os.path.exists(file_path):
         logging.error(f"File not found: {file_path}")
-        raise FileNotFoundError(f"{file_path} not found.")
+        raise FileNotFoundError(f"File not found: {file_path}")
     
     with open(file_path, 'r') as file:
         wallet_addresses = [line.strip() for line in file if line.strip()]

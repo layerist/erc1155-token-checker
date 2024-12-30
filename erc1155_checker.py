@@ -11,40 +11,40 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging with timestamps, levels, and improved formatting
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler()]
 )
 
 def read_proxies(file_path: str) -> List[str]:
     """
-    Reads proxies from a file and returns a list of valid proxy strings.
+    Load proxy list from a file.
     Args:
-        file_path (str): Path to the file containing proxy addresses.
+        file_path (str): Path to the proxy list file.
     Returns:
-        List[str]: A list of proxies read from the file.
+        List[str]: A list of proxy strings.
     """
-    path = Path(file_path)
-    if not path.exists():
-        logging.error(f"File not found: {file_path}")
-        return []
-
     try:
+        path = Path(file_path)
+        if not path.is_file():
+            logging.error(f"File not found: {file_path}")
+            return []
+
         with path.open("r", encoding="utf-8") as file:
             proxies = [line.strip() for line in file if line.strip()]
         logging.info(f"Loaded {len(proxies)} proxies from {file_path}")
         return proxies
     except Exception as e:
-        logging.exception(f"Error reading proxies from file {file_path}: {e}")
+        logging.exception(f"Failed to read proxies from {file_path}: {e}")
         return []
 
 def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
     """
-    Parses a proxy string into a requests-compatible proxy dictionary.
+    Parse proxy into a dictionary compatible with requests.
     Args:
-        proxy (str): Proxy string in format ip:port or ip:port:username:password.
+        proxy (str): Proxy string in ip:port[:username:password] format.
     Returns:
-        Optional[Dict[str, str]]: A dictionary for use with requests or None if invalid format.
+        Optional[Dict[str, str]]: A dictionary for requests or None if invalid.
     """
     parts = proxy.split(":")
     if len(parts) == 2:
@@ -61,13 +61,13 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
 
 def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]:
     """
-    Checks if a proxy is working by sending a request through it.
+    Test if a proxy is functional.
     Args:
-        proxy (str): Proxy string in format ip:port or ip:port:username:password.
-        retries (int): Number of retry attempts for a proxy.
-        timeout (int): Timeout in seconds for the request.
+        proxy (str): Proxy string in ip:port[:username:password] format.
+        retries (int): Number of retry attempts.
+        timeout (int): Request timeout in seconds.
     Returns:
-        Optional[str]: The proxy string if it is working, otherwise None.
+        Optional[str]: The proxy string if valid, None otherwise.
     """
     proxies = parse_proxy(proxy)
     if not proxies:
@@ -78,36 +78,38 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
         try:
             response = requests.get(test_url, proxies=proxies, timeout=timeout, verify=False)
             if response.status_code == 200:
-                logging.info(f"Working proxy: {proxy} (IP: {response.json().get('origin')})")
+                logging.info(f"Valid proxy: {proxy} (IP: {response.json().get('origin')})")
                 return proxy
         except requests.RequestException as e:
-            logging.debug(f"Proxy {proxy} failed (attempt {attempt}/{retries}): {e}")
+            logging.debug(f"Proxy {proxy} failed on attempt {attempt}/{retries}: {e}")
 
-    logging.info(f"Non-working proxy: {proxy}")
+    logging.info(f"Invalid proxy: {proxy}")
     return None
 
 def write_proxies(file_path: str, proxies: List[str]) -> None:
     """
-    Writes working proxies to the specified output file.
+    Save working proxies to a file.
     Args:
-        file_path (str): Path to the file where working proxies will be written.
-        proxies (List[str]): List of working proxies.
+        file_path (str): Destination file path.
+        proxies (List[str]): List of functional proxies.
     """
-    path = Path(file_path)
     try:
+        path = Path(file_path)
         with path.open("w", encoding="utf-8") as file:
             file.writelines(f"{proxy}\n" for proxy in proxies)
-        logging.info(f"Successfully wrote {len(proxies)} working proxies to {file_path}")
+        logging.info(f"Saved {len(proxies)} working proxies to {file_path}")
     except Exception as e:
-        logging.exception(f"Error writing proxies to file {file_path}: {e}")
+        logging.exception(f"Failed to write proxies to {file_path}: {e}")
 
-def main(input_file: str, output_file: str, max_workers: int = 10) -> None:
+def main(input_file: str, output_file: str, max_workers: int = 10, retries: int = 3, timeout: int = 5) -> None:
     """
-    Main function to load, check, and save working proxies.
+    Main workflow: load, check, and save proxies.
     Args:
-        input_file (str): File path to input proxy list.
-        output_file (str): File path to save working proxies.
-        max_workers (int): Number of threads to use for parallel proxy checking.
+        input_file (str): Input file path.
+        output_file (str): Output file path.
+        max_workers (int): Number of parallel threads.
+        retries (int): Retry attempts for each proxy.
+        timeout (int): Request timeout per proxy in seconds.
     """
     start_time = time.time()
 
@@ -118,7 +120,7 @@ def main(input_file: str, output_file: str, max_workers: int = 10) -> None:
 
     working_proxies = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_proxy = {executor.submit(check_proxy, proxy): proxy for proxy in proxies}
+        future_to_proxy = {executor.submit(check_proxy, proxy, retries, timeout): proxy for proxy in proxies}
 
         for future in as_completed(future_to_proxy):
             try:
@@ -126,22 +128,25 @@ def main(input_file: str, output_file: str, max_workers: int = 10) -> None:
                 if result:
                     working_proxies.append(result)
             except Exception as e:
-                logging.error(f"Unexpected error: {e}")
+                logging.error(f"Unexpected error during proxy validation: {e}")
 
     write_proxies(output_file, working_proxies)
     elapsed_time = time.time() - start_time
-    logging.info(f"Finished processing in {elapsed_time:.2f} seconds. Total working proxies: {len(working_proxies)}")
+    logging.info(f"Completed in {elapsed_time:.2f} seconds. Valid proxies: {len(working_proxies)}")
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Check and filter working proxies.")
-    parser.add_argument("input_file", type=str, help="File with list of proxies in ip:port[:username:password] format")
-    parser.add_argument("output_file", type=str, help="Output file for working proxies")
-    parser.add_argument("--max_workers", type=int, default=10, help="Number of threads to use for proxy checking")
+    parser = argparse.ArgumentParser(description="Proxy checker and filter.")
+    parser.add_argument("input_file", help="Path to input file containing proxies.")
+    parser.add_argument("output_file", help="Path to output file for valid proxies.")
+    parser.add_argument("--max_workers", type=int, default=10, help="Number of parallel threads (default: 10).")
+    parser.add_argument("--retries", type=int, default=3, help="Retry attempts per proxy (default: 3).")
+    parser.add_argument("--timeout", type=int, default=5, help="Request timeout in seconds (default: 5).")
+
     args = parser.parse_args()
 
     if args.max_workers < 1:
-        logging.error("Max workers must be a positive integer. Exiting.")
+        logging.error("Max workers must be at least 1. Exiting.")
     else:
-        main(args.input_file, args.output_file, args.max_workers)
+        main(args.input_file, args.output_file, args.max_workers, args.retries, args.timeout)

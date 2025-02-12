@@ -5,11 +5,12 @@ from pathlib import Path
 import time
 import urllib3
 from typing import List, Optional, Dict
+import threading
 
 # Suppress warnings from urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configure logging with timestamps and improved formatting
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -24,7 +25,7 @@ def read_proxies(file_path: str) -> List[str]:
     if not path.is_file():
         logging.error(f"File not found: {file_path}")
         return []
-
+    
     try:
         with path.open("r", encoding="utf-8") as file:
             proxies = [line.strip() for line in file if line.strip()]
@@ -48,7 +49,7 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
     else:
         logging.warning(f"Invalid proxy format: {proxy}")
         return None
-
+    
     return {"http": proxy_url, "https": proxy_url}
 
 def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]:
@@ -58,17 +59,17 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
     proxies = parse_proxy(proxy)
     if not proxies:
         return None
-
+    
     test_url = "http://httpbin.org/ip"
     for attempt in range(1, retries + 1):
         try:
             response = requests.get(test_url, proxies=proxies, timeout=timeout, verify=False)
             if response.status_code == 200:
-                logging.debug(f"Proxy {proxy} succeeded on attempt {attempt}")
                 logging.info(f"Valid proxy: {proxy} (IP: {response.json().get('origin')})")
                 return proxy
         except requests.RequestException:
             logging.debug(f"Proxy {proxy} failed on attempt {attempt}/{retries}")
+    
     logging.info(f"Invalid proxy: {proxy}")
     return None
 
@@ -96,14 +97,14 @@ def main(input_file: str, output_file: str, max_workers: int = 10, retries: int 
         return
 
     working_proxies = []
-    lock = threading.Lock()  # To ensure thread-safe writes
+    lock = threading.Lock()
 
-    def process_proxy(proxy: str) -> None:
+    def process_proxy(proxy: str):
         result = check_proxy(proxy, retries, timeout)
         if result:
             with lock:
                 working_proxies.append(result)
-
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(process_proxy, proxies)
 

@@ -5,7 +5,6 @@ from pathlib import Path
 import time
 import urllib3
 from typing import List, Optional, Dict
-import threading
 
 # Suppress warnings from urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -52,7 +51,7 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
     
     return {"http": proxy_url, "https": proxy_url}
 
-def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]:
+def check_proxy(proxy: str, test_url: str, retries: int = 3, timeout: int = 5) -> Optional[str]:
     """
     Test if a proxy is functional.
     """
@@ -60,14 +59,16 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
     if not proxies:
         return None
     
-    test_url = "http://httpbin.org/ip"
     for attempt in range(1, retries + 1):
         try:
+            start_time = time.time()
             response = requests.get(test_url, proxies=proxies, timeout=timeout, verify=False)
+            elapsed = time.time() - start_time
+            
             if response.status_code == 200:
-                logging.info(f"Valid proxy: {proxy} (IP: {response.json().get('origin')})")
+                logging.info(f"Valid proxy: {proxy} (IP: {response.json().get('origin')}) - Response time: {elapsed:.2f}s")
                 return proxy
-        except requests.RequestException:
+        except (requests.ConnectionError, requests.Timeout):
             logging.debug(f"Proxy {proxy} failed on attempt {attempt}/{retries}")
     
     logging.info(f"Invalid proxy: {proxy}")
@@ -85,7 +86,7 @@ def write_proxies(file_path: str, proxies: List[str]) -> None:
     except Exception as e:
         logging.exception(f"Failed to write proxies to {file_path}: {e}")
 
-def main(input_file: str, output_file: str, max_workers: int = 10, retries: int = 3, timeout: int = 5) -> None:
+def main(input_file: str, output_file: str, test_url: str, max_workers: int = 10, retries: int = 3, timeout: int = 5) -> None:
     """
     Main workflow: load, check, and save proxies.
     """
@@ -97,17 +98,14 @@ def main(input_file: str, output_file: str, max_workers: int = 10, retries: int 
         return
 
     working_proxies = []
-    lock = threading.Lock()
-
-    def process_proxy(proxy: str):
-        result = check_proxy(proxy, retries, timeout)
-        if result:
-            with lock:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_proxy = {executor.submit(check_proxy, proxy, test_url, retries, timeout): proxy for proxy in proxies}
+        
+        for future in as_completed(future_to_proxy):
+            result = future.result()
+            if result:
                 working_proxies.append(result)
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        executor.map(process_proxy, proxies)
-
     write_proxies(output_file, working_proxies)
     elapsed_time = time.time() - start_time
     logging.info(f"Completed in {elapsed_time:.2f} seconds. Valid proxies: {len(working_proxies)}")
@@ -118,6 +116,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Proxy checker and filter.")
     parser.add_argument("input_file", help="Path to input file containing proxies.")
     parser.add_argument("output_file", help="Path to output file for valid proxies.")
+    parser.add_argument("--test_url", type=str, default="http://httpbin.org/ip", help="URL to test proxies against (default: http://httpbin.org/ip).")
     parser.add_argument("--max_workers", type=int, default=10, help="Number of parallel threads (default: 10).")
     parser.add_argument("--retries", type=int, default=3, help="Retry attempts per proxy (default: 3).")
     parser.add_argument("--timeout", type=int, default=5, help="Request timeout in seconds (default: 5).")
@@ -127,4 +126,4 @@ if __name__ == "__main__":
     if args.max_workers < 1:
         logging.error("Max workers must be at least 1. Exiting.")
     else:
-        main(args.input_file, args.output_file, args.max_workers, args.retries, args.timeout)
+        main(args.input_file, args.output_file, args.test_url, args.max_workers, args.retries, args.timeout)

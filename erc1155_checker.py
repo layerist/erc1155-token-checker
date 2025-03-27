@@ -17,14 +17,11 @@ logging.basicConfig(
 )
 
 def read_proxies(file_path: str) -> List[str]:
-    """
-    Load proxy list from a file.
-    """
+    """Load proxy list from a file."""
     path = Path(file_path)
     if not path.is_file():
         logging.error(f"File not found: {file_path}")
         return []
-    
     try:
         with path.open("r", encoding="utf-8") as file:
             proxies = [line.strip() for line in file if line.strip()]
@@ -35,9 +32,7 @@ def read_proxies(file_path: str) -> List[str]:
         return []
 
 def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
-    """
-    Parse proxy into a dictionary compatible with requests.
-    """
+    """Parse proxy into a dictionary compatible with requests."""
     parts = proxy.split(":")
     if len(parts) == 2:
         ip, port = parts
@@ -48,13 +43,10 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
     else:
         logging.warning(f"Invalid proxy format: {proxy}")
         return None
-    
     return {"http": proxy_url, "https": proxy_url}
 
 def check_proxy(proxy: str, test_url: str, retries: int = 3, timeout: int = 5) -> Optional[str]:
-    """
-    Test if a proxy is functional.
-    """
+    """Test if a proxy is functional."""
     proxies = parse_proxy(proxy)
     if not proxies:
         return None
@@ -66,32 +58,28 @@ def check_proxy(proxy: str, test_url: str, retries: int = 3, timeout: int = 5) -
             elapsed = time.time() - start_time
             
             if response.status_code == 200:
-                logging.info(f"Valid proxy: {proxy} (IP: {response.json().get('origin')}) - Response time: {elapsed:.2f}s")
+                ip_info = response.json().get("origin", "Unknown IP")
+                logging.info(f"Valid proxy: {proxy} (IP: {ip_info}) - Response time: {elapsed:.2f}s")
                 return proxy
-        except (requests.ConnectionError, requests.Timeout):
+        except requests.RequestException:
             logging.debug(f"Proxy {proxy} failed on attempt {attempt}/{retries}")
     
     logging.info(f"Invalid proxy: {proxy}")
     return None
 
 def write_proxies(file_path: str, proxies: List[str]) -> None:
-    """
-    Save working proxies to a file.
-    """
-    path = Path(file_path)
+    """Save working proxies to a file."""
     try:
-        with path.open("w", encoding="utf-8") as file:
+        with Path(file_path).open("w", encoding="utf-8") as file:
             file.writelines(f"{proxy}\n" for proxy in proxies)
         logging.info(f"Saved {len(proxies)} working proxies to {file_path}")
     except Exception as e:
         logging.exception(f"Failed to write proxies to {file_path}: {e}")
 
 def main(input_file: str, output_file: str, test_url: str, max_workers: int = 10, retries: int = 3, timeout: int = 5) -> None:
-    """
-    Main workflow: load, check, and save proxies.
-    """
+    """Main workflow: load, check, and save proxies."""
     start_time = time.time()
-
+    
     proxies = read_proxies(input_file)
     if not proxies:
         logging.error("No proxies to process. Exiting.")

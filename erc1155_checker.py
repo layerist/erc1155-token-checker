@@ -12,13 +12,6 @@ from tqdm import tqdm
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configure logger
-logger = logging.getLogger("ProxyChecker")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-logger.addHandler(handler)
-
 # Default request headers
 HEADERS = {
     "User-Agent": (
@@ -29,8 +22,19 @@ HEADERS = {
 }
 
 
-def read_proxies(file_path: str) -> List[str]:
-    """Load proxies from file, remove duplicates and empty lines."""
+def setup_logger(verbose: bool = False) -> logging.Logger:
+    """Configure and return a logger instance."""
+    logger = logging.getLogger("ProxyChecker")
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s"))
+    if not logger.hasHandlers():
+        logger.addHandler(handler)
+    return logger
+
+
+def read_proxies(file_path: str, logger: logging.Logger) -> List[str]:
+    """Load proxies from file, remove duplicates and invalid lines."""
     path = Path(file_path)
     if not path.is_file():
         logger.error(f"File not found: {file_path}")
@@ -46,7 +50,7 @@ def read_proxies(file_path: str) -> List[str]:
         return []
 
 
-def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
+def parse_proxy(proxy: str, logger: logging.Logger) -> Optional[Dict[str, str]]:
     """Parse proxy string into requests-compatible format."""
     try:
         parts = proxy.split(":")
@@ -57,7 +61,7 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
             ip, port, user, pwd = parts
             url = f"http://{user}:{pwd}@{ip}:{port}"
         else:
-            logger.warning(f"Invalid proxy format: {proxy}")
+            logger.debug(f"Invalid proxy format: {proxy}")
             return None
         return {"http": url, "https": url}
     except Exception as e:
@@ -65,9 +69,9 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
         return None
 
 
-def check_proxy(proxy: str, test_url: str, retries: int, timeout: int, delay: float = 0.5) -> Optional[str]:
+def check_proxy(proxy: str, test_url: str, retries: int, timeout: int, logger: logging.Logger, delay: float = 0.3) -> Optional[str]:
     """Check if a single proxy is functional."""
-    proxy_conf = parse_proxy(proxy)
+    proxy_conf = parse_proxy(proxy, logger)
     if not proxy_conf:
         return None
 
@@ -84,8 +88,7 @@ def check_proxy(proxy: str, test_url: str, retries: int, timeout: int, delay: fl
             duration = time.perf_counter() - start
 
             if response.status_code == 200:
-                ip = response.json().get("origin", "unknown")
-                logger.info(f"✔ Proxy OK: {proxy} | IP: {ip} | Time: {duration:.2f}s")
+                logger.info(f"✔ Proxy OK: {proxy} | Time: {duration:.2f}s")
                 return proxy
             else:
                 logger.debug(f"[{attempt}/{retries}] Bad response {response.status_code} from {proxy}")
@@ -95,7 +98,7 @@ def check_proxy(proxy: str, test_url: str, retries: int, timeout: int, delay: fl
     return None
 
 
-def write_proxies(file_path: str, proxies: List[str]) -> None:
+def write_proxies(file_path: str, proxies: List[str], logger: logging.Logger) -> None:
     """Write working proxies to a file."""
     try:
         with Path(file_path).open("w", encoding="utf-8") as file:
@@ -112,21 +115,22 @@ def validate_proxies(
     max_workers: int,
     retries: int,
     timeout: int,
+    logger: logging.Logger,
 ) -> List[str]:
     """Check proxies concurrently using a thread pool."""
     valid = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(check_proxy, proxy, test_url, retries, timeout): proxy
+        futures = {
+            executor.submit(check_proxy, proxy, test_url, retries, timeout, logger): proxy
             for proxy in proxies
         }
-        for future in tqdm(as_completed(future_map), total=len(future_map), desc="Validating", ncols=100):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Validating", ncols=100):
             try:
                 result = future.result()
                 if result:
                     valid.append(result)
             except Exception as e:
-                logger.debug(f"Unhandled exception for {future_map[future]} | Error: {e}")
+                logger.debug(f"Unhandled exception for {futures[future]} | Error: {e}")
     return valid
 
 
@@ -138,23 +142,24 @@ def main():
     parser.add_argument("--max_workers", type=int, default=20, help="Number of threads (default: 20)")
     parser.add_argument("--retries", type=int, default=3, help="Retries per proxy (default: 3)")
     parser.add_argument("--timeout", type=int, default=5, help="Timeout per request in seconds (default: 5)")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
+    logger = setup_logger(args.verbose)
 
     if args.max_workers < 1:
         logger.error("max_workers must be >= 1")
         return
 
     start = time.perf_counter()
-
     try:
-        proxies = read_proxies(args.input_file)
+        proxies = read_proxies(args.input_file, logger)
         if not proxies:
             logger.warning("No proxies to check.")
             return
 
-        valid = validate_proxies(proxies, args.test_url, args.max_workers, args.retries, args.timeout)
-        write_proxies(args.output_file, valid)
+        valid = validate_proxies(proxies, args.test_url, args.max_workers, args.retries, args.timeout, logger)
+        write_proxies(args.output_file, valid, logger)
 
         elapsed = time.perf_counter() - start
         logger.info(f"Completed in {elapsed:.2f}s | {len(valid)} valid out of {len(proxies)}")

@@ -1,6 +1,7 @@
 import argparse
 import logging
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -9,10 +10,9 @@ import requests
 import urllib3
 from tqdm import tqdm
 
-# Disable SSL warnings
+# Disable SSL warnings globally
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Default request headers
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,12 +23,28 @@ HEADERS = {
 
 
 # ------------------- Logging -------------------
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        "DEBUG": "\033[37m",   # Gray
+        "INFO": "\033[36m",    # Cyan
+        "WARNING": "\033[33m", # Yellow
+        "ERROR": "\033[31m",   # Red
+        "CRITICAL": "\033[41m" # Red background
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelname, self.RESET)
+        message = super().format(record)
+        return f"{color}{message}{self.RESET}"
+
+
 def setup_logger(verbose: bool = False) -> logging.Logger:
-    """Configure and return a logger instance."""
+    """Set up a colored logger with configurable verbosity."""
     logger = logging.getLogger("ProxyChecker")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s"))
+    handler.setFormatter(ColorFormatter("%(asctime)s | %(levelname)-8s | %(message)s"))
     if not logger.hasHandlers():
         logger.addHandler(handler)
     return logger
@@ -36,7 +52,7 @@ def setup_logger(verbose: bool = False) -> logging.Logger:
 
 # ------------------- I/O -------------------
 def read_proxies(file_path: str, logger: logging.Logger) -> List[str]:
-    """Load proxies from file and remove duplicates."""
+    """Read and deduplicate proxy list from file."""
     path = Path(file_path)
     if not path.is_file():
         logger.error(f"File not found: {file_path}")
@@ -44,7 +60,7 @@ def read_proxies(file_path: str, logger: logging.Logger) -> List[str]:
 
     try:
         with path.open("r", encoding="utf-8") as f:
-            proxies = list({line.strip() for line in f if line.strip()})
+            proxies = sorted(set(line.strip() for line in f if line.strip()))
         logger.info(f"Loaded {len(proxies)} unique proxies from '{file_path}'")
         return proxies
     except Exception as e:
@@ -53,7 +69,7 @@ def read_proxies(file_path: str, logger: logging.Logger) -> List[str]:
 
 
 def write_proxies(file_path: str, proxies: List[str], logger: logging.Logger) -> None:
-    """Write valid proxies to a file."""
+    """Save valid proxies to file."""
     try:
         output_path = Path(file_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -61,24 +77,21 @@ def write_proxies(file_path: str, proxies: List[str], logger: logging.Logger) ->
             f.write("\n".join(proxies))
         logger.info(f"Saved {len(proxies)} working proxies to '{file_path}'")
     except Exception as e:
-        logger.exception(f"Failed to save proxies: {e}")
+        logger.exception(f"Failed to write proxies: {e}")
 
 
-# ------------------- Proxy Parsing -------------------
-def parse_proxy(proxy: str, logger: logging.Logger) -> Optional[Dict[str, str]]:
-    """
-    Convert a proxy string into a format usable by requests.
-    Supports both HTTP and SOCKS (socks4/socks5).
-    """
-    try:
-        if "://" not in proxy:
+# ------------------- Proxy Handling -------------------
+def parse_proxy(proxy: str) -> Dict[str, str]:
+    """Normalize and return proxy dictionary for requests."""
+    if "://" not in proxy:
+        # Auto-detect protocol
+        if proxy.startswith("socks5"):
+            proxy = "socks5h://" + proxy.split("socks5")[-1].lstrip("://")
+        elif proxy.startswith("socks4"):
+            proxy = "socks4://" + proxy.split("socks4")[-1].lstrip("://")
+        else:
             proxy = "http://" + proxy
-
-        # Validate structure (requests will handle socks if installed)
-        return {"http": proxy, "https": proxy}
-    except Exception as e:
-        logger.debug(f"Error parsing proxy '{proxy}': {e}")
-        return None
+    return {"http": proxy, "https": proxy}
 
 
 # ------------------- Proxy Checking -------------------
@@ -88,34 +101,32 @@ def check_proxy(
     retries: int,
     timeout: int,
     logger: logging.Logger,
-    delay: float = 0.3,
+    delay: float,
 ) -> Optional[str]:
-    """Check if a single proxy is functional, with retries and timing."""
-    proxy_conf = parse_proxy(proxy, logger)
-    if not proxy_conf:
-        return None
+    """Test a single proxy for availability and responsiveness."""
+    proxy_conf = parse_proxy(proxy)
 
     for attempt in range(1, retries + 1):
         try:
             start = time.perf_counter()
-            response = requests.get(
+            resp = requests.get(
                 test_url,
                 proxies=proxy_conf,
                 headers=HEADERS,
                 timeout=timeout,
                 verify=False,
             )
-            duration = time.perf_counter() - start
+            elapsed = time.perf_counter() - start
 
-            if response.status_code == 200:
-                logger.info(f"✔ OK: {proxy} | {duration:.2f}s")
+            if resp.status_code == 200:
+                logger.info(f"✔ OK: {proxy} | {elapsed:.2f}s")
                 return proxy
             else:
-                logger.debug(f"[{attempt}/{retries}] Bad response {response.status_code} | {proxy}")
+                logger.debug(f"[{attempt}/{retries}] Bad response {resp.status_code} | {proxy}")
         except requests.RequestException as e:
-            logger.debug(f"[{attempt}/{retries}] Failed: {proxy} | {e}")
-        # Exponential backoff for retries
-        time.sleep(delay * (attempt ** 1.2))
+            logger.debug(f"[{attempt}/{retries}] Failed {proxy}: {e}")
+        # Exponential backoff + random jitter
+        time.sleep(delay * (attempt ** 1.2) * (1 + random.random() * 0.3))
     return None
 
 
@@ -126,16 +137,23 @@ def validate_proxies(
     retries: int,
     timeout: int,
     logger: logging.Logger,
+    delay: float = 0.3,
 ) -> List[str]:
-    """Validate proxies concurrently with a progress bar."""
+    """Validate proxies concurrently using ThreadPoolExecutor."""
     valid = []
     total = len(proxies)
+
+    logger.info(f"Starting validation of {total} proxies with {max_workers} threads")
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(check_proxy, proxy, test_url, retries, timeout, logger): proxy for proxy in proxies}
+        future_to_proxy = {
+            executor.submit(check_proxy, proxy, test_url, retries, timeout, logger, delay): proxy
+            for proxy in proxies
+        }
 
         with tqdm(total=total, desc="Checking proxies", ncols=100, unit="proxy") as pbar:
-            for future in as_completed(futures):
-                proxy = futures[future]
+            for future in as_completed(future_to_proxy):
+                proxy = future_to_proxy[future]
                 try:
                     result = future.result()
                     if result:
@@ -146,42 +164,41 @@ def validate_proxies(
                 finally:
                     pbar.update(1)
 
+    logger.info(f"Validation complete: {len(valid)} valid proxies")
     return valid
 
 
 # ------------------- Main -------------------
 def main():
-    parser = argparse.ArgumentParser(description="High-performance multithreaded proxy checker.")
-    parser.add_argument("input_file", help="File containing proxies (one per line)")
-    parser.add_argument("output_file", help="File to save valid proxies")
-    parser.add_argument("--test_url", default="http://httpbin.org/ip", help="URL used for testing proxies")
-    parser.add_argument("--max_workers", type=int, default=50, help="Number of threads (default: 50)")
-    parser.add_argument("--retries", type=int, default=3, help="Retries per proxy (default: 3)")
-    parser.add_argument("--timeout", type=int, default=5, help="Timeout for each request (default: 5)")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser = argparse.ArgumentParser(description="Fast multithreaded proxy checker")
+    parser.add_argument("input_file", help="File with proxy list (one per line)")
+    parser.add_argument("output_file", help="Destination file for valid proxies")
+    parser.add_argument("--test_url", default="http://httpbin.org/ip", help="URL to test proxies against")
+    parser.add_argument("--max_workers", type=int, default=50, help="Number of concurrent threads")
+    parser.add_argument("--retries", type=int, default=3, help="Number of retry attempts per proxy")
+    parser.add_argument("--timeout", type=int, default=5, help="Request timeout in seconds")
+    parser.add_argument("--delay", type=float, default=0.3, help="Base delay between retries")
+    parser.add_argument("--verbose", action="store_true", help="Enable detailed logging")
 
     args = parser.parse_args()
     logger = setup_logger(args.verbose)
 
-    if args.max_workers < 1:
-        logger.error("max_workers must be >= 1")
-        return
-
-    start = time.perf_counter()
+    start_time = time.perf_counter()
     try:
         proxies = read_proxies(args.input_file, logger)
         if not proxies:
-            logger.warning("No proxies to validate.")
+            logger.warning("No proxies found. Exiting.")
             return
 
-        valid_proxies = validate_proxies(
-            proxies, args.test_url, args.max_workers, args.retries, args.timeout, logger
+        valid = validate_proxies(
+            proxies, args.test_url, args.max_workers, args.retries, args.timeout, logger, args.delay
         )
 
-        write_proxies(args.output_file, valid_proxies, logger)
+        write_proxies(args.output_file, valid, logger)
 
-        elapsed = time.perf_counter() - start
-        logger.info(f"Completed in {elapsed:.2f}s | {len(valid_proxies)} valid out of {len(proxies)}")
+        duration = time.perf_counter() - start_time
+        logger.info(f"Done in {duration:.2f}s | {len(valid)} valid of {len(proxies)} total")
+
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
     except Exception as e:

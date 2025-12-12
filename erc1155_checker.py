@@ -21,7 +21,6 @@ HEADERS = {
     )
 }
 
-
 # ------------------- Logging -------------------
 class ColorFormatter(logging.Formatter):
     COLORS = {
@@ -38,7 +37,6 @@ class ColorFormatter(logging.Formatter):
         message = super().format(record)
         return f"{color}{message}{self.RESET}"
 
-
 def setup_logger(verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("ProxyChecker")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -51,21 +49,15 @@ def setup_logger(verbose: bool = False) -> logging.Logger:
 
     return logger
 
-
 # ------------------- Proxy Utilities -------------------
 def normalize_proxy(proxy: str) -> Optional[Dict[str, str]]:
-    """
-    Normalize proxy into requests format.
-    Returns None if proxy is malformed.
-    """
+    """Normalize proxy into requests format. Returns None if malformed."""
     proxy = proxy.strip()
 
     if not proxy:
         return None
 
-    # Add schema if missing
     if "://" not in proxy:
-        # Auto-detect
         if proxy.startswith(("socks5", "socks5h")):
             proxy = "socks5h://" + proxy.split("socks5")[-1].lstrip(":/")
         elif proxy.startswith("socks4"):
@@ -75,8 +67,8 @@ def normalize_proxy(proxy: str) -> Optional[Dict[str, str]]:
 
     return {"http": proxy, "https": proxy}
 
-
 def read_proxies(file_path: str, logger: logging.Logger) -> List[str]:
+    """Reads proxies from file and normalizes them."""
     path = Path(file_path)
     if not path.is_file():
         logger.error(f"File not found: {file_path}")
@@ -85,18 +77,16 @@ def read_proxies(file_path: str, logger: logging.Logger) -> List[str]:
     try:
         with path.open("r", encoding="utf-8") as f:
             proxies = sorted(set(
-                line.strip() for line in f
-                if line.strip() and normalize_proxy(line.strip())
+                line.strip() for line in f if line.strip() and normalize_proxy(line.strip())
             ))
         logger.info(f"Loaded {len(proxies)} unique proxies")
         return proxies
-
     except Exception as e:
         logger.exception(f"Failed to read proxies: {e}")
         return []
 
-
 def write_proxies(file_path: str, proxies: List[str], logger: logging.Logger) -> None:
+    """Write valid proxies to file."""
     try:
         output_path = Path(file_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,12 +96,10 @@ def write_proxies(file_path: str, proxies: List[str], logger: logging.Logger) ->
     except Exception as e:
         logger.exception(f"Failed to write proxies: {e}")
 
-
 # ------------------- Proxy Checking -------------------
 _SESSION = requests.Session()
 _SESSION.verify = False
 _SESSION.headers.update(HEADERS)
-
 
 def check_proxy(
     proxy: str,
@@ -121,9 +109,7 @@ def check_proxy(
     delay: float,
     logger: logging.Logger,
 ) -> Optional[str]:
-    """
-    Test proxy with retry logic and exponential backoff.
-    """
+    """Test proxy with retry logic and exponential backoff."""
     proxy_conf = normalize_proxy(proxy)
     if not proxy_conf:
         return None
@@ -131,13 +117,7 @@ def check_proxy(
     for attempt in range(1, retries + 1):
         try:
             start = time.perf_counter()
-
-            resp = _SESSION.get(
-                test_url,
-                proxies=proxy_conf,
-                timeout=timeout,
-            )
-
+            resp = _SESSION.get(test_url, proxies=proxy_conf, timeout=timeout)
             elapsed = time.perf_counter() - start
 
             if resp.status_code == 200:
@@ -145,7 +125,6 @@ def check_proxy(
                 return proxy
 
             logger.debug(f"[{attempt}/{retries}] Bad status {resp.status_code} | {proxy}")
-
         except Exception as e:
             logger.debug(f"[{attempt}/{retries}] Fail {proxy}: {e}")
 
@@ -154,7 +133,6 @@ def check_proxy(
         time.sleep(backoff)
 
     return None
-
 
 def validate_proxies(
     proxies: List[str],
@@ -165,13 +143,13 @@ def validate_proxies(
     delay: float,
     logger: logging.Logger,
 ) -> List[str]:
+    """Validate proxies in parallel with adaptive concurrency."""
     valid = []
     total = len(proxies)
     failures = 0
 
     logger.info(f"Validating {total} proxies with {max_workers} threads...")
 
-    # Adaptive concurrency (reduces threads if too many failures early)
     if total > 200:
         max_workers = min(max_workers, 150)
 
@@ -192,13 +170,11 @@ def validate_proxies(
                 bar.set_postfix(valid=len(valid))
                 bar.update(1)
 
-                # If everything is failing → reduce noise
                 if failures > total * 0.85 and logger.level > logging.DEBUG:
                     logger.setLevel(logging.WARNING)
 
     logger.info(f"Complete: {len(valid)} valid of {total}")
     return valid
-
 
 # ------------------- Main -------------------
 def main():
@@ -240,7 +216,6 @@ def main():
         logger.warning("Interrupted by user.")
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
-
 
 if __name__ == "__main__":
     main()

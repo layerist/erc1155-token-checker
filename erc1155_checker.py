@@ -2,11 +2,12 @@
 """
 High-performance multithreaded proxy checker.
 
-Improvements:
-- Thread-local sessions (safe + faster)
-- Stronger proxy normalization
-- Adaptive backoff with jitter
-- Clearer logging and structure
+Features:
+- Thread-local sessions with connection pooling
+- Robust proxy normalization
+- Exponential backoff with jitter
+- Graceful shutdown on Ctrl+C
+- Clean logging and progress reporting
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from typing import Dict, List, Optional
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
 # ------------------- Global Settings -------------------
@@ -75,7 +77,17 @@ def get_session() -> requests.Session:
         session = requests.Session()
         session.verify = False
         session.headers.update(DEFAULT_HEADERS)
+
+        adapter = HTTPAdapter(
+            pool_connections=50,
+            pool_maxsize=50,
+            max_retries=0,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
         _thread_local.session = session
+
     return _thread_local.session
 
 
@@ -86,14 +98,12 @@ def normalize_proxy(proxy: str) -> Optional[Dict[str, str]]:
         return None
 
     if "://" not in proxy:
-        if proxy.startswith(("socks5h", "socks5")):
-            proxy = f"socks5h://{proxy.split('socks5')[-1].lstrip(':/')}"
-        elif proxy.startswith("socks4"):
-            proxy = f"socks4://{proxy.split('socks4')[-1].lstrip(':/')}"
-        else:
-            proxy = f"http://{proxy}"
+        proxy = f"http://{proxy}"
 
-    return {"http": proxy, "https": proxy}
+    return {
+        "http": proxy,
+        "https": proxy,
+    }
 
 
 def read_proxies(path: str, logger: logging.Logger) -> List[str]:
@@ -106,7 +116,7 @@ def read_proxies(path: str, logger: logging.Logger) -> List[str]:
     with file.open(encoding="utf-8", errors="ignore") as f:
         for line in f:
             p = line.strip()
-            if p and normalize_proxy(p):
+            if normalize_proxy(p):
                 proxies.add(p)
 
     logger.info("Loaded %d unique proxies", len(proxies))
@@ -156,10 +166,10 @@ def check_proxy(
                 r.status_code,
                 proxy,
             )
+
         except Exception as e:
             logger.debug("[%d/%d] FAIL %s | %s", attempt, retries, proxy, e)
 
-        # Exponential backoff + jitter
         delay = base_delay * (2 ** (attempt - 1))
         delay *= 1 + random.random() * 0.4
         time.sleep(delay)
@@ -176,19 +186,19 @@ def validate_proxies(
     delay: float,
     logger: logging.Logger,
 ) -> List[str]:
+    if not proxies:
+        return []
+
     total = len(proxies)
-    valid: List[str] = []
-
-    if total == 0:
-        return valid
-
-    if total > 200:
-        max_workers = min(max_workers, 150)
+    max_workers = min(max_workers, 150 if total > 200 else max_workers)
 
     logger.info("Checking %d proxies using %d threads", total, max_workers)
 
+    valid: List[str] = []
+    stop_event = threading.Event()
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
+        futures = {
             executor.submit(
                 check_proxy,
                 proxy,
@@ -197,18 +207,26 @@ def validate_proxies(
                 timeout,
                 delay,
                 logger,
-            )
+            ): proxy
             for proxy in proxies
-        ]
+        }
 
-        with tqdm(total=total, unit="proxy", ncols=100) as bar:
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    valid.append(result)
+        try:
+            with tqdm(total=total, unit="proxy", ncols=100) as bar:
+                for future in as_completed(futures):
+                    if stop_event.is_set():
+                        break
 
-                bar.set_postfix(valid=len(valid))
-                bar.update(1)
+                    result = future.result()
+                    if result:
+                        valid.append(result)
+
+                    bar.set_postfix(valid=len(valid))
+                    bar.update(1)
+
+        except KeyboardInterrupt:
+            stop_event.set()
+            logger.warning("Interrupted by user, stopping checks…")
 
     logger.info("Done: %d / %d valid", len(valid), total)
     return valid
@@ -231,27 +249,23 @@ def main() -> None:
 
     start = time.perf_counter()
 
-    try:
-        proxies = read_proxies(args.input_file, logger)
-        if not proxies:
-            logger.warning("No proxies to check.")
-            return
+    proxies = read_proxies(args.input_file, logger)
+    if not proxies:
+        logger.warning("No proxies to check.")
+        return
 
-        valid = validate_proxies(
-            proxies,
-            args.test_url,
-            args.max_workers,
-            args.retries,
-            args.timeout,
-            args.delay,
-            logger,
-        )
+    valid = validate_proxies(
+        proxies,
+        args.test_url,
+        args.max_workers,
+        args.retries,
+        args.timeout,
+        args.delay,
+        logger,
+    )
 
-        write_proxies(args.output_file, valid, logger)
-
-        logger.info("Finished in %.2fs", time.perf_counter() - start)
-    except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
+    write_proxies(args.output_file, valid, logger)
+    logger.info("Finished in %.2fs", time.perf_counter() - start)
 
 
 if __name__ == "__main__":

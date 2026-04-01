@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ultra-fast multithreaded proxy checker
+Ultra-fast multithreaded proxy checker (improved)
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 import requests
 import urllib3
@@ -22,10 +22,11 @@ from tqdm import tqdm
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-MAX_GLOBAL_WORKERS = 400
+MAX_GLOBAL_WORKERS = 500
+BATCH_SIZE = 1000  # prevents huge memory spikes
 
 
 # --------------------------------------------------
@@ -48,7 +49,7 @@ def setup_logger(verbose: bool) -> logging.Logger:
 
 
 # --------------------------------------------------
-# Thread local session
+# Thread-local session
 # --------------------------------------------------
 
 _thread_local = threading.local()
@@ -56,14 +57,13 @@ _thread_local = threading.local()
 
 def get_session() -> requests.Session:
     if not hasattr(_thread_local, "session"):
-
         session = requests.Session()
         session.verify = False
         session.headers.update(DEFAULT_HEADERS)
 
         adapter = HTTPAdapter(
-            pool_connections=200,
-            pool_maxsize=200,
+            pool_connections=300,
+            pool_maxsize=300,
             max_retries=0,
         )
 
@@ -80,22 +80,24 @@ def get_session() -> requests.Session:
 # --------------------------------------------------
 
 def normalize_proxy(proxy: str, https_only: bool) -> Optional[Dict[str, str]]:
-
     proxy = proxy.strip()
     if not proxy:
         return None
 
+    # auto-detect scheme
     if "://" not in proxy:
         proxy = "http://" + proxy
 
     if https_only and not proxy.startswith("https://"):
         return None
 
-    return {"http": proxy, "https": proxy}
+    return {
+        "http": proxy,
+        "https": proxy,
+    }
 
 
 def read_proxies(path: str, logger: logging.Logger) -> List[str]:
-
     file = Path(path)
 
     if not file.exists():
@@ -103,17 +105,15 @@ def read_proxies(path: str, logger: logging.Logger) -> List[str]:
         return []
 
     with file.open("r", encoding="utf-8", errors="ignore") as f:
-        proxies = {line.strip() for line in f if line.strip()}
+        proxies = list({line.strip() for line in f if line.strip()})
 
     logger.info("Loaded %d unique proxies", len(proxies))
-    return list(proxies)
+    return proxies
 
 
 def write_proxies(path: str, proxies: List[str], logger: logging.Logger):
-
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-
     p.write_text("\n".join(proxies), encoding="utf-8")
 
     logger.info("Saved %d proxies → %s", len(proxies), path)
@@ -134,7 +134,6 @@ def check_proxy(
 ) -> Optional[str]:
 
     proxy_cfg = normalize_proxy(proxy, https_only)
-
     if not proxy_cfg:
         return None
 
@@ -145,33 +144,42 @@ def check_proxy(
         try:
             start = time.perf_counter()
 
+            # Try HEAD first (faster)
             r = session.head(
                 url,
                 proxies=proxy_cfg,
                 timeout=(timeout, timeout),
                 allow_redirects=False,
-                stream=False,
             )
+
+            # fallback to GET if HEAD fails
+            if r.status_code >= 400:
+                r = session.get(
+                    url,
+                    proxies=proxy_cfg,
+                    timeout=(timeout, timeout),
+                    stream=False,
+                )
 
             latency = time.perf_counter() - start
 
             if r.status_code == 200:
-
                 if max_latency and latency > max_latency:
                     return None
-
                 return proxy
 
         except requests.RequestException:
             pass
 
-        time.sleep(delay * (1.5 ** attempt) * random.uniform(0.8, 1.2))
+        # smarter backoff
+        sleep_time = delay * (2 ** attempt) * random.uniform(0.7, 1.3)
+        time.sleep(sleep_time)
 
     return None
 
 
 # --------------------------------------------------
-# Validation
+# Validation (batched for performance)
 # --------------------------------------------------
 
 def validate_proxies(
@@ -186,40 +194,40 @@ def validate_proxies(
 ) -> List[str]:
 
     total = len(proxies)
-
     workers = min(workers, total, MAX_GLOBAL_WORKERS)
 
     valid: List[str] = []
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-
-        futures = (
-            executor.submit(
-                check_proxy,
-                proxy,
-                url,
-                retries,
-                timeout,
-                delay,
-                https_only,
-                max_latency,
-            )
-            for proxy in proxies
-        )
-
         with tqdm(total=total, unit="proxy", ncols=100) as bar:
 
-            for future in as_completed(list(futures)):
+            # process in batches (important!)
+            for i in range(0, total, BATCH_SIZE):
+                batch = proxies[i:i + BATCH_SIZE]
 
-                try:
-                    res = future.result()
-                    if res:
-                        valid.append(res)
+                futures = [
+                    executor.submit(
+                        check_proxy,
+                        proxy,
+                        url,
+                        retries,
+                        timeout,
+                        delay,
+                        https_only,
+                        max_latency,
+                    )
+                    for proxy in batch
+                ]
 
-                except Exception:
-                    pass
+                for future in as_completed(futures):
+                    try:
+                        res = future.result()
+                        if res:
+                            valid.append(res)
+                    except Exception:
+                        pass
 
-                bar.update(1)
+                    bar.update(1)
 
     return valid
 
@@ -229,14 +237,13 @@ def validate_proxies(
 # --------------------------------------------------
 
 def main():
-
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Ultra-fast proxy checker")
 
     parser.add_argument("input_file")
     parser.add_argument("output_file")
 
     parser.add_argument("--test_url", default="https://httpbin.org/ip")
-    parser.add_argument("--workers", type=int, default=200)
+    parser.add_argument("--workers", type=int, default=300)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=5)
     parser.add_argument("--delay", type=float, default=0.2)
@@ -251,7 +258,6 @@ def main():
     start = time.perf_counter()
 
     proxies = read_proxies(args.input_file, logger)
-
     if not proxies:
         return
 

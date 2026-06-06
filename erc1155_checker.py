@@ -711,3 +711,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[!] Interrupted")
         sys.exit(1)
+
+
+# Improvements suggested: adaptive timeouts, better proxy parsing, async DNS cache, metrics, resume, quarantine list.

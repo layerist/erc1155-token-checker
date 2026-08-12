@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Reliable ERC-1155 balance checker.
+ERC-1155 balance checker v2.
 
-Key features:
-- Web3.py 6/7 compatible
-- Polygon by default, configurable chain ID and multiple RPC endpoints
-- Built-in minimal ERC-1155 ABI (external ABI remains optional)
-- RPC failover with exponential backoff and jitter
-- Batch calls with adaptive chunk splitting before single-call fallback
-- Optional fixed block for a consistent snapshot
-- JSONL or text output
-- Resume support for JSONL output
-- Invalid-wallet reporting, progress logs, and deterministic token ordering
-- No private keys or transactions: read-only eth_call requests only
+Improvements over the previous version:
+- Web3.py 6/7 compatible API usage
+- Multiple RPC endpoints with health-aware failover and cooldowns
+- Fixed snapshot support that is safe across --resume runs
+- Resume is bound to the exact contract / chain / token set / block
+- Adaptive ERC-1155 balanceOfBatch splitting with balanceOf fallback
+- Built-in minimal ABI, optional external ABI validation
+- Deterministic token ordering and duplicate removal
+- Invalid-wallet reporting
+- JSONL metadata and per-row scan identity
+- Better final statistics, including total token units found
+- Read-only eth_call / eth_getCode requests only
+
+The script never needs private keys and never sends transactions.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +46,10 @@ DEFAULT_CHUNK_SIZE = 200
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_SLEEP = 0.5
 DEFAULT_TIMEOUT = 20
+DEFAULT_RPC_COOLDOWN = 2.0
+MAX_RPC_COOLDOWN = 30.0
+JSONL_SCHEMA = 2
+ERC1155_INTERFACE_ID = "0xd9b67a26"
 
 MINIMAL_ERC1155_ABI: list[dict[str, Any]] = [
     {
@@ -67,10 +75,20 @@ MINIMAL_ERC1155_ABI: list[dict[str, Any]] = [
 ]
 
 
-@dataclass(frozen=True)
+@dataclass
 class RpcEndpoint:
     url: str
     w3: Web3
+    chain_id: int
+    failures: int = 0
+    cooldown_until: float = 0.0
+    successes: int = 0
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    completed_wallets: set[str]
+    metadata: dict[str, Any] | None
 
 
 class RpcPool:
@@ -82,9 +100,11 @@ class RpcPool:
         expected_chain_id: int | None,
         retries: int,
         retry_sleep: float,
+        cooldown_base: float,
     ) -> None:
         self.retries = retries
         self.retry_sleep = retry_sleep
+        self.cooldown_base = cooldown_base
         self._endpoints: list[RpcEndpoint] = []
         self._index = 0
 
@@ -100,28 +120,73 @@ class RpcPool:
                         f"unexpected chain ID {chain_id}, expected {expected_chain_id}"
                     )
                 block = int(w3.eth.block_number)
-                self._endpoints.append(RpcEndpoint(url=url, w3=w3))
-                LOG.info("RPC ready: %s | chain=%s | block=%s", redact_url(url), chain_id, block)
+                self._endpoints.append(
+                    RpcEndpoint(url=url, w3=w3, chain_id=chain_id)
+                )
+                LOG.info(
+                    "RPC ready: %s | chain=%s | block=%s",
+                    redact_url(url),
+                    chain_id,
+                    block,
+                )
             except Exception as exc:
-                LOG.warning("RPC unavailable: %s | %s", redact_url(url), exc)
+                LOG.warning("RPC unavailable: %s | %s", redact_url(url), compact_error(exc))
 
         if not self._endpoints:
             raise ConnectionError("No usable RPC endpoints")
 
+        chain_ids = {endpoint.chain_id for endpoint in self._endpoints}
+        if len(chain_ids) != 1:
+            raise ValueError(f"RPC endpoints disagree on chain ID: {sorted(chain_ids)}")
+
     @property
-    def current(self) -> RpcEndpoint:
-        return self._endpoints[self._index]
+    def chain_id(self) -> int:
+        return self._endpoints[0].chain_id
+
+    def _next_ready_endpoint(self) -> RpcEndpoint:
+        now = time.monotonic()
+        count = len(self._endpoints)
+
+        for offset in range(count):
+            index = (self._index + offset) % count
+            endpoint = self._endpoints[index]
+            if endpoint.cooldown_until <= now:
+                self._index = index
+                return endpoint
+
+        earliest = min(self._endpoints, key=lambda item: item.cooldown_until)
+        sleep_for = max(0.0, earliest.cooldown_until - now)
+        if sleep_for > 0:
+            LOG.debug("All RPC endpoints cooling down; sleeping %.2fs", sleep_for)
+            time.sleep(sleep_for)
+        self._index = self._endpoints.index(earliest)
+        return earliest
+
+    def _mark_success(self, endpoint: RpcEndpoint) -> None:
+        endpoint.successes += 1
+        endpoint.failures = 0
+        endpoint.cooldown_until = 0.0
+
+    def _mark_failure(self, endpoint: RpcEndpoint) -> None:
+        endpoint.failures += 1
+        exponent = min(endpoint.failures - 1, 6)
+        cooldown = min(self.cooldown_base * (2**exponent), MAX_RPC_COOLDOWN)
+        endpoint.cooldown_until = time.monotonic() + cooldown
+        self._index = (self._endpoints.index(endpoint) + 1) % len(self._endpoints)
 
     def call(self, fn: Callable[[Web3], T], description: str) -> T:
         last_error: Exception | None = None
         attempts = max(1, self.retries) * len(self._endpoints)
 
         for attempt in range(1, attempts + 1):
-            endpoint = self.current
+            endpoint = self._next_ready_endpoint()
             try:
-                return fn(endpoint.w3)
+                result = fn(endpoint.w3)
+                self._mark_success(endpoint)
+                return result
             except Exception as exc:
                 last_error = exc
+                self._mark_failure(endpoint)
                 LOG.warning(
                     "%s failed via %s (%s/%s): %s",
                     description,
@@ -130,13 +195,19 @@ class RpcPool:
                     attempts,
                     compact_error(exc),
                 )
-                self._index = (self._index + 1) % len(self._endpoints)
                 if attempt < attempts:
-                    exponent = min((attempt - 1) // len(self._endpoints), 6)
-                    delay = self.retry_sleep * (2**exponent) + random.uniform(0, 0.25)
-                    time.sleep(delay)
+                    rounds = (attempt - 1) // max(1, len(self._endpoints))
+                    delay = self.retry_sleep * (2 ** min(rounds, 6))
+                    if delay > 0:
+                        time.sleep(delay + random.uniform(0, min(0.25, delay / 2 + 0.01)))
 
         raise RuntimeError(f"{description} failed: {compact_error(last_error)}") from last_error
+
+    def health_summary(self) -> str:
+        return "; ".join(
+            f"{redact_url(e.url)} success={e.successes} failures={e.failures}"
+            for e in self._endpoints
+        )
 
 
 def setup_logging(level: str) -> None:
@@ -163,15 +234,21 @@ def to_checksum_address(value: str) -> str:
     return str(method(value))
 
 
+def is_address(value: str) -> bool:
+    method = getattr(Web3, "is_address", None) or getattr(Web3, "isAddress", None)
+    if method is None:
+        raise RuntimeError("Unsupported Web3.py version")
+    return bool(method(value))
+
+
 def validate_address(value: str, label: str) -> str:
     value = value.strip()
-    if not Web3.is_address(value):
+    if not is_address(value):
         raise ValueError(f"Invalid {label}: {value!r}")
     return to_checksum_address(value)
 
 
 def redact_url(url: str) -> str:
-    # Avoid leaking API keys embedded in RPC URLs into logs.
     if "?" in url:
         return url.split("?", 1)[0] + "?…"
     parts = url.rsplit("/", 1)
@@ -244,11 +321,19 @@ def load_abi(path_value: str | None) -> list[dict[str, Any]]:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid ABI JSON: {path}: {exc}") from exc
-    # Some explorers return {"abi": [...]}.
     if isinstance(data, dict) and isinstance(data.get("abi"), list):
         data = data["abi"]
     if not isinstance(data, list):
         raise ValueError("ABI must be a JSON list or an object containing an 'abi' list")
+
+    function_names = {
+        item.get("name")
+        for item in data
+        if isinstance(item, dict) and item.get("type") == "function"
+    }
+    missing = {"balanceOf", "balanceOfBatch"} - function_names
+    if missing:
+        raise ValueError(f"ABI is missing required ERC-1155 function(s): {', '.join(sorted(missing))}")
     return data
 
 
@@ -265,7 +350,6 @@ def read_wallets(path_value: str, *, strict: bool) -> tuple[list[str], list[dict
         clean = line.split("#", 1)[0].strip()
         if not clean:
             continue
-        # Accept either one address per line or the first CSV/whitespace field.
         raw = clean.replace(",", " ").split()[0]
         try:
             wallet = validate_address(raw, "wallet address")
@@ -284,10 +368,35 @@ def read_wallets(path_value: str, *, strict: bool) -> tuple[list[str], list[dict
     return wallets, errors
 
 
-def completed_wallets_from_jsonl(path: Path) -> set[str]:
+def write_invalid_wallets(path_value: str | None, invalid_wallets: list[dict[str, Any]]) -> None:
+    if not path_value or not invalid_wallets:
+        return
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in invalid_wallets) + "\n",
+        encoding="utf-8",
+    )
+    LOG.info("Invalid-wallet report written: %s (%s rows)", path, len(invalid_wallets))
+
+
+def token_set_hash(token_ids: Sequence[int]) -> str:
+    payload = ",".join(str(token_id) for token_id in token_ids).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def scan_identity(contract: str, chain_id: int, token_hash: str) -> str:
+    payload = f"{contract.lower()}|{chain_id}|{token_hash}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_resume_state(path: Path) -> ResumeState:
+    if not path.exists() or path.stat().st_size == 0:
+        return ResumeState(completed_wallets=set(), metadata=None)
+
     completed: set[str] = set()
-    if not path.exists():
-        return completed
+    metadata: dict[str, Any] | None = None
+
     for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         if not line.strip():
             continue
@@ -296,21 +405,80 @@ def completed_wallets_from_jsonl(path: Path) -> set[str]:
         except json.JSONDecodeError:
             LOG.warning("Ignoring malformed JSONL line %s while resuming", line_number)
             continue
+
+        if isinstance(item, dict) and isinstance(item.get("_meta"), dict):
+            if metadata is None:
+                metadata = item["_meta"]
+            continue
+
+        if not isinstance(item, dict):
+            continue
         wallet = item.get("wallet")
         if isinstance(wallet, str) and item.get("ok") is True:
             completed.add(wallet.lower())
-    return completed
+
+    return ResumeState(completed_wallets=completed, metadata=metadata)
+
+
+def validate_resume_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    scan_id: str,
+    contract: str,
+    chain_id: int,
+    token_hash: str,
+) -> None:
+    if metadata is None:
+        raise ValueError(
+            "--resume requires a v2 JSONL file containing scan metadata. "
+            "The existing output looks legacy/metadata-less; use a new output file or --clear-output."
+        )
+
+    expected = {
+        "schema": JSONL_SCHEMA,
+        "scan_id": scan_id,
+        "contract": contract,
+        "chain_id": chain_id,
+        "token_set_hash": token_hash,
+    }
+    mismatches: list[str] = []
+    for key, value in expected.items():
+        actual = metadata.get(key)
+        if key == "contract" and isinstance(actual, str):
+            same = actual.lower() == str(value).lower()
+        else:
+            same = actual == value
+        if not same:
+            mismatches.append(f"{key}: existing={actual!r}, requested={value!r}")
+    if mismatches:
+        raise ValueError("Resume output belongs to another scan: " + "; ".join(mismatches))
 
 
 class ResultWriter:
-    def __init__(self, path_value: str, output_format: str, *, flush: bool) -> None:
+    def __init__(
+        self,
+        path_value: str,
+        output_format: str,
+        *,
+        flush: bool,
+        metadata: dict[str, Any] | None,
+        write_metadata: bool,
+    ) -> None:
         self.path = Path(path_value)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.format = output_format
+        self.flush = flush
         self.handle = self.path.open("a", encoding="utf-8", buffering=1 if flush else -1)
 
+        if output_format == "jsonl" and metadata is not None and write_metadata:
+            self.handle.write(
+                json.dumps({"_meta": metadata}, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+
     def close(self) -> None:
-        self.handle.close()
+        if not self.handle.closed:
+            self.handle.flush()
+            self.handle.close()
 
     def __enter__(self) -> "ResultWriter":
         return self
@@ -321,27 +489,29 @@ class ResultWriter:
     def write(self, result: dict[str, Any]) -> None:
         if self.format == "jsonl":
             self.handle.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
-            return
-
-        wallet = result["wallet"]
-        self.handle.write(f"Address: {wallet}\n")
-        if not result.get("ok"):
-            self.handle.write(f"  ERROR: {result.get('error', 'unknown error')}\n\n")
-            return
-        tokens = result.get("tokens", [])
-        if tokens:
-            for token in tokens:
-                self.handle.write(
-                    f"  Token ID: {token['token_id']}, Balance: {token['balance']}\n"
-                )
         else:
-            self.handle.write("  No ERC1155 tokens found.\n")
-        self.handle.write("\n")
+            wallet = result["wallet"]
+            self.handle.write(f"Address: {wallet}\n")
+            if not result.get("ok"):
+                self.handle.write(f"  ERROR: {result.get('error', 'unknown error')}\n\n")
+            else:
+                tokens = result.get("tokens", [])
+                if tokens:
+                    for token in tokens:
+                        self.handle.write(
+                            f"  Token ID: {token['token_id']}, Balance: {token['balance']}\n"
+                        )
+                else:
+                    self.handle.write("  No ERC1155 tokens found.\n")
+                self.handle.write("\n")
+
+        if self.flush:
+            self.handle.flush()
 
 
 def ensure_contract(pool: RpcPool, address: str) -> None:
     code = pool.call(lambda w3: w3.eth.get_code(address), "eth_getCode")
-    if not code or bytes(code) == b"":
+    if not code or len(bytes(code)) == 0:
         raise ValueError(f"No contract bytecode at {address}")
 
 
@@ -365,7 +535,9 @@ def fetch_batch(
             block_identifier=block_identifier
         )
         if len(values) != len(token_ids):
-            raise ValueError(f"balanceOfBatch returned {len(values)} values for {len(token_ids)} IDs")
+            raise ValueError(
+                f"balanceOfBatch returned {len(values)} values for {len(token_ids)} IDs"
+            )
         return [int(value) for value in values]
 
     return pool.call(invoke, f"balanceOfBatch wallet={wallet} ids={len(token_ids)}")
@@ -479,13 +651,50 @@ def scan_wallet(
 def resolve_rpc_urls(cli_urls: Sequence[str] | None) -> list[str]:
     values: list[str] = []
     if cli_urls:
-        values.extend(cli_urls)
+        values.extend(url.strip() for url in cli_urls if url.strip())
     env_value = os.getenv("POLYGON_RPC_URLS") or os.getenv("POLYGON_RPC_URL")
     if env_value:
         values.extend(part.strip() for part in env_value.split(",") if part.strip())
     if not values:
         values.append(DEFAULT_RPC)
-    return values
+    return unique_preserving_order(values)
+
+
+def resolve_block(
+    args: argparse.Namespace,
+    pool: RpcPool,
+    resume_metadata: dict[str, Any] | None,
+) -> int | str:
+    if args.block == "latest":
+        if args.resume:
+            raise ValueError(
+                "--resume cannot be combined with --block latest because resumed rows would not share one snapshot"
+            )
+        return "latest"
+
+    if args.block == "snapshot":
+        if args.resume and resume_metadata is not None:
+            existing_block = resume_metadata.get("block")
+            if not isinstance(existing_block, int):
+                raise ValueError("Resume metadata does not contain a valid fixed snapshot block")
+            LOG.info("Reusing snapshot block from output: %s", existing_block)
+            return existing_block
+        return pool.call(lambda w3: int(w3.eth.block_number), "get snapshot block")
+
+    try:
+        block = int(args.block, 0)
+    except ValueError as exc:
+        raise ValueError("--block must be 'snapshot', 'latest', or an integer") from exc
+    if block < 0:
+        raise ValueError("--block cannot be negative")
+
+    if args.resume and resume_metadata is not None:
+        existing_block = resume_metadata.get("block")
+        if existing_block != block:
+            raise ValueError(
+                f"Resume output uses block {existing_block}, but --block requested {block}"
+            )
+    return block
 
 
 def process(args: argparse.Namespace) -> None:
@@ -497,6 +706,8 @@ def process(args: argparse.Namespace) -> None:
         raise ValueError("--retry-sleep cannot be negative")
     if args.request_timeout <= 0:
         raise ValueError("--request-timeout must be greater than zero")
+    if args.rpc_cooldown < 0:
+        raise ValueError("--rpc-cooldown cannot be negative")
 
     contract_address = validate_address(args.contract, "contract address")
     token_ids = normalize_token_ids((args.tokens or []) + parse_token_file(args.token_file))
@@ -507,15 +718,27 @@ def process(args: argparse.Namespace) -> None:
     wallets, invalid_wallets = read_wallets(args.wallets, strict=args.strict_wallets)
     if not wallets:
         raise ValueError("No valid wallet addresses found")
+    write_invalid_wallets(args.invalid_wallets_output, invalid_wallets)
 
     output_path = Path(args.output)
     if args.clear_output:
         output_path.unlink(missing_ok=True)
     if args.resume and args.format != "jsonl":
         raise ValueError("--resume is supported only with --format jsonl")
+    if (
+        args.format == "jsonl"
+        and output_path.exists()
+        and output_path.stat().st_size > 0
+        and not args.resume
+        and not args.clear_output
+    ):
+        raise ValueError(
+            f"Output already exists and is not empty: {output_path}. "
+            "Use --resume for the same scan, --clear-output to replace it, or choose another --output. "
+            "This prevents accidental mixing of unrelated scans."
+        )
 
-    completed = completed_wallets_from_jsonl(output_path) if args.resume else set()
-    wallets_to_scan = [wallet for wallet in wallets if wallet.lower() not in completed]
+    resume_state = load_resume_state(output_path) if args.resume else ResumeState(set(), None)
 
     pool = RpcPool(
         resolve_rpc_urls(args.rpc),
@@ -523,30 +746,65 @@ def process(args: argparse.Namespace) -> None:
         expected_chain_id=None if args.chain_id < 0 else args.chain_id,
         retries=args.retries,
         retry_sleep=args.retry_sleep,
+        cooldown_base=args.rpc_cooldown,
     )
     ensure_contract(pool, contract_address)
 
-    if args.block == "latest":
-        block_identifier: int | str = "latest"
-    elif args.block == "snapshot":
-        block_identifier = pool.call(lambda w3: int(w3.eth.block_number), "get snapshot block")
-    else:
-        block_identifier = int(args.block, 0)
+    effective_chain_id = pool.chain_id
+    t_hash = token_set_hash(token_ids)
+    scan_id = scan_identity(contract_address, effective_chain_id, t_hash)
+
+    if args.resume:
+        validate_resume_metadata(
+            resume_state.metadata,
+            scan_id=scan_id,
+            contract=contract_address,
+            chain_id=effective_chain_id,
+            token_hash=t_hash,
+        )
+
+    block_identifier = resolve_block(args, pool, resume_state.metadata)
+
+    metadata = {
+        "schema": JSONL_SCHEMA,
+        "scan_id": scan_id,
+        "contract": contract_address,
+        "chain_id": effective_chain_id,
+        "token_set_hash": t_hash,
+        "token_count": len(token_ids),
+        "block": block_identifier,
+        "created_at": int(time.time()),
+    }
+
+    completed = resume_state.completed_wallets if args.resume else set()
+    wallets_to_scan = [wallet for wallet in wallets if wallet.lower() not in completed]
 
     LOG.info(
-        "Scan start | wallets=%s pending=%s tokens=%s chunk=%s block=%s invalid_wallets=%s",
+        "Scan start | wallets=%s pending=%s tokens=%s chunk=%s block=%s invalid_wallets=%s scan_id=%s",
         len(wallets),
         len(wallets_to_scan),
         len(token_ids),
         args.chunk_size,
         block_identifier,
         len(invalid_wallets),
+        scan_id[:12],
     )
 
     started = time.monotonic()
-    successful = failed = wallets_with_tokens = positive_balances = 0
+    successful = 0
+    failed = 0
+    wallets_with_tokens = 0
+    positive_token_ids = 0
+    total_token_units = 0
 
-    with ResultWriter(args.output, args.format, flush=not args.no_flush) as writer:
+    write_metadata = args.format == "jsonl" and (not output_path.exists() or output_path.stat().st_size == 0)
+    with ResultWriter(
+        args.output,
+        args.format,
+        flush=not args.no_flush,
+        metadata=metadata,
+        write_metadata=write_metadata,
+    ) as writer:
         for index, wallet in enumerate(wallets_to_scan, 1):
             wallet_started = time.monotonic()
             try:
@@ -561,17 +819,21 @@ def process(args: argparse.Namespace) -> None:
                     no_batch=args.no_batch,
                 )
                 successful += 1
+                units = sum(balance for _, balance in tokens)
                 if tokens:
                     wallets_with_tokens += 1
-                    positive_balances += len(tokens)
+                    positive_token_ids += len(tokens)
+                    total_token_units += units
                 result = {
                     "wallet": wallet,
                     "ok": True,
+                    "scan_id": scan_id,
                     "contract": contract_address,
-                    "chain_id": None if args.chain_id < 0 else args.chain_id,
+                    "chain_id": effective_chain_id,
                     "block": block_identifier,
                     "checked_token_count": len(token_ids),
                     "positive_balance_count": len(tokens),
+                    "total_token_units": units,
                     "tokens": [
                         {"token_id": token_id, "balance": balance}
                         for token_id, balance in tokens
@@ -585,35 +847,45 @@ def process(args: argparse.Namespace) -> None:
                 result = {
                     "wallet": wallet,
                     "ok": False,
+                    "scan_id": scan_id,
                     "contract": contract_address,
-                    "chain_id": None if args.chain_id < 0 else args.chain_id,
+                    "chain_id": effective_chain_id,
                     "block": block_identifier,
                     "checked_token_count": len(token_ids),
+                    "positive_balance_count": 0,
+                    "total_token_units": 0,
                     "tokens": [],
                     "error": compact_error(exc),
                     "elapsed_ms": round((time.monotonic() - wallet_started) * 1000),
                     "timestamp": int(time.time()),
                 }
+                if args.fail_fast:
+                    writer.write(result)
+                    raise
+
             writer.write(result)
             LOG.info(
-                "Progress %s/%s | %s | found=%s | %.2fs",
+                "Progress %s/%s | %s | positive_ids=%s units=%s | %.2fs",
                 index,
                 len(wallets_to_scan),
                 wallet,
                 result.get("positive_balance_count", 0),
+                result.get("total_token_units", 0),
                 time.monotonic() - wallet_started,
             )
 
     LOG.info(
         "Completed | success=%s failed=%s skipped_resume=%s wallets_with_tokens=%s "
-        "positive_balances=%s elapsed=%.2fs",
+        "positive_token_ids=%s total_token_units=%s elapsed=%.2fs",
         successful,
         failed,
         len(completed),
         wallets_with_tokens,
-        positive_balances,
+        positive_token_ids,
+        total_token_units,
         time.monotonic() - started,
     )
+    LOG.info("RPC health | %s", pool.health_summary())
 
 
 def parse_args() -> argparse.Namespace:
@@ -625,6 +897,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-file", help="Text file containing token IDs")
     parser.add_argument("--wallets", default="wallet_addresses.txt", help="Wallet file")
     parser.add_argument("--output", default="wallet_tokens.jsonl", help="Output path")
+    parser.add_argument(
+        "--invalid-wallets-output",
+        help="Optional JSONL file for invalid wallet rows",
+    )
     parser.add_argument(
         "--abi",
         help="Optional ABI JSON. The built-in minimal ERC-1155 ABI is used by default",
@@ -638,7 +914,7 @@ def parse_args() -> argparse.Namespace:
         "--chain-id",
         type=int,
         default=int(os.getenv("CHAIN_ID", str(DEFAULT_CHAIN_ID))),
-        help="Expected chain ID; use -1 to disable validation",
+        help="Expected chain ID; use -1 to auto-detect/disable explicit validation",
     )
     parser.add_argument(
         "--block",
@@ -661,16 +937,27 @@ def parse_args() -> argparse.Namespace:
         default=float(os.getenv("RETRY_SLEEP", str(DEFAULT_RETRY_SLEEP))),
     )
     parser.add_argument(
+        "--rpc-cooldown",
+        type=float,
+        default=float(os.getenv("RPC_COOLDOWN", str(DEFAULT_RPC_COOLDOWN))),
+        help="Base cooldown in seconds for a failing RPC endpoint",
+    )
+    parser.add_argument(
         "--request-timeout",
         type=int,
         default=int(os.getenv("REQUEST_TIMEOUT", str(DEFAULT_TIMEOUT))),
     )
     parser.add_argument("--format", choices=("jsonl", "text"), default="jsonl")
     parser.add_argument("--no-batch", action="store_true", help="Use balanceOf only")
-    parser.add_argument("--resume", action="store_true", help="Skip successful wallets in existing JSONL")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a matching v2 JSONL scan and reuse its fixed snapshot block",
+    )
     parser.add_argument("--clear-output", action="store_true", help="Delete output before scan")
     parser.add_argument("--strict-wallets", action="store_true", help="Fail on first invalid wallet")
-    parser.add_argument("--no-flush", action="store_true", help="Do not line-flush output")
+    parser.add_argument("--fail-fast", action="store_true", help="Stop after first wallet failure")
+    parser.add_argument("--no-flush", action="store_true", help="Do not flush output after every wallet")
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     return parser.parse_args()
 

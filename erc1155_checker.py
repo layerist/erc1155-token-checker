@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ERC-1155 balance checker v2.
+ERC-1155 balance checker v3.
 
 Improvements over the previous version:
 - Web3.py 6/7 compatible API usage
@@ -13,6 +13,10 @@ Improvements over the previous version:
 - Invalid-wallet reporting
 - JSONL metadata and per-row scan identity
 - Better final statistics, including total token units found
+- Concurrent wallet scanning with thread-safe RPC rotation
+- Adaptive batch-size learning across wallets
+- Cached contract objects per RPC endpoint
+- Fast abort of deterministic RPC errors before pointless failover retries
 - Read-only eth_call / eth_getCode requests only
 
 The script never needs private keys and never sends transactions.
@@ -28,6 +32,8 @@ import os
 import random
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
@@ -47,6 +53,7 @@ DEFAULT_RETRIES = 3
 DEFAULT_RETRY_SLEEP = 0.5
 DEFAULT_TIMEOUT = 20
 DEFAULT_RPC_COOLDOWN = 2.0
+DEFAULT_WORKERS = 4
 MAX_RPC_COOLDOWN = 30.0
 JSONL_SCHEMA = 2
 ERC1155_INTERFACE_ID = "0xd9b67a26"
@@ -83,6 +90,7 @@ class RpcEndpoint:
     failures: int = 0
     cooldown_until: float = 0.0
     successes: int = 0
+    contracts: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +115,7 @@ class RpcPool:
         self.cooldown_base = cooldown_base
         self._endpoints: list[RpcEndpoint] = []
         self._index = 0
+        self._lock = threading.Lock()
 
         for url in unique_preserving_order(urls):
             provider = Web3.HTTPProvider(url, request_kwargs={"timeout": timeout})
@@ -121,7 +130,7 @@ class RpcPool:
                     )
                 block = int(w3.eth.block_number)
                 self._endpoints.append(
-                    RpcEndpoint(url=url, w3=w3, chain_id=chain_id)
+                    RpcEndpoint(url=url, w3=w3, chain_id=chain_id, contracts={})
                 )
                 LOG.info(
                     "RPC ready: %s | chain=%s | block=%s",
@@ -144,38 +153,46 @@ class RpcPool:
         return self._endpoints[0].chain_id
 
     def _next_ready_endpoint(self) -> RpcEndpoint:
-        now = time.monotonic()
-        count = len(self._endpoints)
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                count = len(self._endpoints)
 
-        for offset in range(count):
-            index = (self._index + offset) % count
-            endpoint = self._endpoints[index]
-            if endpoint.cooldown_until <= now:
-                self._index = index
-                return endpoint
+                for offset in range(count):
+                    index = (self._index + offset) % count
+                    endpoint = self._endpoints[index]
+                    if endpoint.cooldown_until <= now:
+                        self._index = (index + 1) % count
+                        return endpoint
 
-        earliest = min(self._endpoints, key=lambda item: item.cooldown_until)
-        sleep_for = max(0.0, earliest.cooldown_until - now)
-        if sleep_for > 0:
-            LOG.debug("All RPC endpoints cooling down; sleeping %.2fs", sleep_for)
-            time.sleep(sleep_for)
-        self._index = self._endpoints.index(earliest)
-        return earliest
+                earliest = min(self._endpoints, key=lambda item: item.cooldown_until)
+                sleep_for = max(0.0, earliest.cooldown_until - now)
+
+            if sleep_for > 0:
+                LOG.debug("All RPC endpoints cooling down; sleeping %.2fs", sleep_for)
+                time.sleep(sleep_for)
 
     def _mark_success(self, endpoint: RpcEndpoint) -> None:
-        endpoint.successes += 1
-        endpoint.failures = 0
-        endpoint.cooldown_until = 0.0
+        with self._lock:
+            endpoint.successes += 1
+            endpoint.failures = 0
+            endpoint.cooldown_until = 0.0
 
     def _mark_failure(self, endpoint: RpcEndpoint) -> None:
-        endpoint.failures += 1
-        exponent = min(endpoint.failures - 1, 6)
-        cooldown = min(self.cooldown_base * (2**exponent), MAX_RPC_COOLDOWN)
-        endpoint.cooldown_until = time.monotonic() + cooldown
-        self._index = (self._endpoints.index(endpoint) + 1) % len(self._endpoints)
+        with self._lock:
+            endpoint.failures += 1
+            exponent = min(endpoint.failures - 1, 6)
+            cooldown = min(self.cooldown_base * (2**exponent), MAX_RPC_COOLDOWN)
+            endpoint.cooldown_until = time.monotonic() + cooldown
 
-    def call(self, fn: Callable[[Web3], T], description: str) -> T:
-        last_error: Exception | None = None
+    def call(
+        self,
+        fn: Callable[[Web3], T],
+        description: str,
+        *,
+        retryable: Callable[[BaseException], bool] | None = None,
+    ) -> T:
+        last_error: BaseException | None = None
         attempts = max(1, self.retries) * len(self._endpoints)
 
         for attempt in range(1, attempts + 1):
@@ -186,7 +203,19 @@ class RpcPool:
                 return result
             except Exception as exc:
                 last_error = exc
-                self._mark_failure(endpoint)
+
+                should_retry = True if retryable is None else bool(retryable(exc))
+                if should_retry:
+                    self._mark_failure(endpoint)
+                else:
+                    LOG.debug(
+                        "%s produced a deterministic/non-retryable error via %s: %s",
+                        description,
+                        redact_url(endpoint.url),
+                        compact_error(exc),
+                    )
+                    break
+
                 LOG.warning(
                     "%s failed via %s (%s/%s): %s",
                     description,
@@ -203,10 +232,29 @@ class RpcPool:
 
         raise RuntimeError(f"{description} failed: {compact_error(last_error)}") from last_error
 
+    def get_contract(self, w3: Web3, address: str, abi: list[dict[str, Any]]):
+        endpoint = next((e for e in self._endpoints if e.w3 is w3), None)
+        if endpoint is None:
+            return w3.eth.contract(address=address, abi=abi)
+
+        key = address.lower()
+        with self._lock:
+            assert endpoint.contracts is not None
+            contract = endpoint.contracts.get(key)
+            if contract is None:
+                contract = w3.eth.contract(address=address, abi=abi)
+                endpoint.contracts[key] = contract
+            return contract
+
     def health_summary(self) -> str:
+        with self._lock:
+            snapshot = [
+                (e.url, e.successes, e.failures, max(0.0, e.cooldown_until - time.monotonic()))
+                for e in self._endpoints
+            ]
         return "; ".join(
-            f"{redact_url(e.url)} success={e.successes} failures={e.failures}"
-            for e in self._endpoints
+            f"{redact_url(url)} success={successes} failures={failures} cooldown={cooldown:.1f}s"
+            for url, successes, failures, cooldown in snapshot
         )
 
 
@@ -262,6 +310,45 @@ def compact_error(exc: BaseException | None) -> str:
         return "unknown error"
     text = " ".join(str(exc).split())
     return text[:500]
+
+
+def is_retryable_rpc_error(exc: BaseException) -> bool:
+    """Return False for errors that another RPC retry is very unlikely to fix."""
+    text = compact_error(exc).lower()
+    deterministic_markers = (
+        "execution reverted",
+        "invalid opcode",
+        "out of gas",
+        "gas required exceeds allowance",
+        "response size exceeded",
+        "request entity too large",
+        "payload too large",
+        "batch limit",
+        "limit exceeded",
+        "too many results",
+    )
+    return not any(marker in text for marker in deterministic_markers)
+
+
+class AdaptiveBatchSizer:
+    """Learns a conservative working batch size after oversized/reverting calls."""
+
+    def __init__(self, initial: int) -> None:
+        self._limit = max(1, initial)
+        self._lock = threading.Lock()
+
+    def get(self) -> int:
+        with self._lock:
+            return self._limit
+
+    def reduce_after_failure(self, failed_size: int) -> int:
+        candidate = max(1, failed_size // 2)
+        with self._lock:
+            if candidate < self._limit:
+                old = self._limit
+                self._limit = candidate
+                LOG.warning("Adaptive batch limit reduced: %s -> %s", old, self._limit)
+            return self._limit
 
 
 def unique_preserving_order(values: Iterable[T]) -> list[T]:
@@ -390,6 +477,38 @@ def scan_identity(contract: str, chain_id: int, token_hash: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def repair_truncated_jsonl_tail(path: Path) -> bool:
+    """Repair only a torn final JSONL record; never hide corruption in the middle."""
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+
+    data = path.read_bytes()
+    if data.endswith(b"\n"):
+        return False
+
+    last_newline = data.rfind(b"\n")
+    tail = data[last_newline + 1 :]
+    try:
+        json.loads(tail.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        keep = data[: last_newline + 1] if last_newline >= 0 else b""
+        backup = path.with_suffix(path.suffix + ".truncated")
+        if not backup.exists():
+            backup.write_bytes(data)
+        path.write_bytes(keep)
+        LOG.warning(
+            "Removed a truncated final JSONL record from %s; original saved as %s",
+            path,
+            backup,
+        )
+        return True
+
+    # Valid final JSON object, merely missing the line terminator.
+    with path.open("ab") as handle:
+        handle.write(b"\n")
+    return True
+
+
 def load_resume_state(path: Path) -> ResumeState:
     if not path.exists() or path.stat().st_size == 0:
         return ResumeState(completed_wallets=set(), metadata=None)
@@ -402,9 +521,10 @@ def load_resume_state(path: Path) -> ResumeState:
             continue
         try:
             item = json.loads(line)
-        except json.JSONDecodeError:
-            LOG.warning("Ignoring malformed JSONL line %s while resuming", line_number)
-            continue
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Malformed JSONL at {path}:{line_number}; refusing unsafe resume"
+            ) from exc
 
         if isinstance(item, dict) and isinstance(item.get("_meta"), dict):
             if metadata is None:
@@ -413,6 +533,16 @@ def load_resume_state(path: Path) -> ResumeState:
 
         if not isinstance(item, dict):
             continue
+
+        if metadata is not None and "scan_id" in item:
+            row_scan_id = item.get("scan_id")
+            meta_scan_id = metadata.get("scan_id")
+            if row_scan_id != meta_scan_id:
+                raise ValueError(
+                    f"JSONL row {line_number} belongs to scan_id={row_scan_id!r}, "
+                    f"but metadata declares scan_id={meta_scan_id!r}"
+                )
+
         wallet = item.get("wallet")
         if isinstance(wallet, str) and item.get("ok") is True:
             completed.add(wallet.lower())
@@ -530,7 +660,7 @@ def fetch_batch(
     addresses = [wallet] * len(token_ids)
 
     def invoke(w3: Web3) -> list[int]:
-        contract = make_contract(w3, contract_address, abi)
+        contract = pool.get_contract(w3, contract_address, abi)
         values = contract.functions.balanceOfBatch(addresses, list(token_ids)).call(
             block_identifier=block_identifier
         )
@@ -540,7 +670,11 @@ def fetch_batch(
             )
         return [int(value) for value in values]
 
-    return pool.call(invoke, f"balanceOfBatch wallet={wallet} ids={len(token_ids)}")
+    return pool.call(
+        invoke,
+        f"balanceOfBatch wallet={wallet} ids={len(token_ids)}",
+        retryable=is_retryable_rpc_error,
+    )
 
 
 def fetch_single(
@@ -552,14 +686,18 @@ def fetch_single(
     block_identifier: int | str,
 ) -> int:
     def invoke(w3: Web3) -> int:
-        contract = make_contract(w3, contract_address, abi)
+        contract = pool.get_contract(w3, contract_address, abi)
         return int(
             contract.functions.balanceOf(wallet, token_id).call(
                 block_identifier=block_identifier
             )
         )
 
-    return pool.call(invoke, f"balanceOf wallet={wallet} token={token_id}")
+    return pool.call(
+        invoke,
+        f"balanceOf wallet={wallet} token={token_id}",
+        retryable=is_retryable_rpc_error,
+    )
 
 
 def fetch_chunk_adaptive(
@@ -571,6 +709,7 @@ def fetch_chunk_adaptive(
     block_identifier: int | str,
     *,
     allow_batch: bool,
+    batch_sizer: AdaptiveBatchSizer,
 ) -> list[tuple[int, int]]:
     if not token_ids:
         return []
@@ -586,13 +725,20 @@ def fetch_chunk_adaptive(
                 if balance > 0
             ]
         except Exception as exc:
+            root = exc.__cause__ if exc.__cause__ is not None else exc
+            if is_retryable_rpc_error(root):
+                # Transport/rate-limit failures are not cured by recursively
+                # multiplying the number of eth_call requests.
+                raise
+
+            batch_sizer.reduce_after_failure(len(token_ids))
             midpoint = len(token_ids) // 2
             LOG.warning(
-                "Batch of %s IDs failed; splitting into %s + %s: %s",
+                "Batch of %s IDs failed with a deterministic/size error; splitting into %s + %s: %s",
                 len(token_ids),
                 midpoint,
                 len(token_ids) - midpoint,
-                compact_error(exc),
+                compact_error(root),
             )
             left = fetch_chunk_adaptive(
                 pool,
@@ -602,6 +748,7 @@ def fetch_chunk_adaptive(
                 token_ids[:midpoint],
                 block_identifier,
                 allow_batch=True,
+                batch_sizer=batch_sizer,
             )
             right = fetch_chunk_adaptive(
                 pool,
@@ -611,6 +758,7 @@ def fetch_chunk_adaptive(
                 token_ids[midpoint:],
                 block_identifier,
                 allow_batch=True,
+                batch_sizer=batch_sizer,
             )
             return left + right
 
@@ -631,9 +779,13 @@ def scan_wallet(
     *,
     chunk_size: int,
     no_batch: bool,
+    batch_sizer: AdaptiveBatchSizer,
 ) -> list[tuple[int, int]]:
     found: list[tuple[int, int]] = []
-    for chunk in iter_chunks(token_ids, chunk_size):
+    position = 0
+    while position < len(token_ids):
+        effective_size = 1 if no_batch else min(chunk_size, batch_sizer.get())
+        chunk = token_ids[position : position + effective_size]
         found.extend(
             fetch_chunk_adaptive(
                 pool,
@@ -643,8 +795,10 @@ def scan_wallet(
                 chunk,
                 block_identifier,
                 allow_batch=not no_batch,
+                batch_sizer=batch_sizer,
             )
         )
+        position += len(chunk)
     return sorted(found)
 
 
@@ -708,6 +862,8 @@ def process(args: argparse.Namespace) -> None:
         raise ValueError("--request-timeout must be greater than zero")
     if args.rpc_cooldown < 0:
         raise ValueError("--rpc-cooldown cannot be negative")
+    if args.workers <= 0:
+        raise ValueError("--workers must be greater than zero")
 
     contract_address = validate_address(args.contract, "contract address")
     token_ids = normalize_token_ids((args.tokens or []) + parse_token_file(args.token_file))
@@ -738,7 +894,11 @@ def process(args: argparse.Namespace) -> None:
             "This prevents accidental mixing of unrelated scans."
         )
 
-    resume_state = load_resume_state(output_path) if args.resume else ResumeState(set(), None)
+    if args.resume:
+        repair_truncated_jsonl_tail(output_path)
+        resume_state = load_resume_state(output_path)
+    else:
+        resume_state = ResumeState(set(), None)
 
     pool = RpcPool(
         resolve_rpc_urls(args.rpc),
@@ -780,11 +940,12 @@ def process(args: argparse.Namespace) -> None:
     wallets_to_scan = [wallet for wallet in wallets if wallet.lower() not in completed]
 
     LOG.info(
-        "Scan start | wallets=%s pending=%s tokens=%s chunk=%s block=%s invalid_wallets=%s scan_id=%s",
+        "Scan start | wallets=%s pending=%s tokens=%s chunk=%s workers=%s block=%s invalid_wallets=%s scan_id=%s",
         len(wallets),
         len(wallets_to_scan),
         len(token_ids),
         args.chunk_size,
+        args.workers,
         block_identifier,
         len(invalid_wallets),
         scan_id[:12],
@@ -796,6 +957,57 @@ def process(args: argparse.Namespace) -> None:
     wallets_with_tokens = 0
     positive_token_ids = 0
     total_token_units = 0
+    batch_sizer = AdaptiveBatchSizer(args.chunk_size)
+
+    def scan_one(wallet: str) -> dict[str, Any]:
+        wallet_started = time.monotonic()
+        try:
+            tokens = scan_wallet(
+                pool,
+                contract_address,
+                abi,
+                wallet,
+                token_ids,
+                block_identifier,
+                chunk_size=args.chunk_size,
+                no_batch=args.no_batch,
+                batch_sizer=batch_sizer,
+            )
+            units = sum(balance for _, balance in tokens)
+            return {
+                "wallet": wallet,
+                "ok": True,
+                "scan_id": scan_id,
+                "contract": contract_address,
+                "chain_id": effective_chain_id,
+                "block": block_identifier,
+                "checked_token_count": len(token_ids),
+                "positive_balance_count": len(tokens),
+                "total_token_units": units,
+                "tokens": [
+                    {"token_id": token_id, "balance": balance}
+                    for token_id, balance in tokens
+                ],
+                "elapsed_ms": round((time.monotonic() - wallet_started) * 1000),
+                "timestamp": int(time.time()),
+            }
+        except Exception as exc:
+            LOG.error("Wallet failed: %s | %s", wallet, compact_error(exc))
+            return {
+                "wallet": wallet,
+                "ok": False,
+                "scan_id": scan_id,
+                "contract": contract_address,
+                "chain_id": effective_chain_id,
+                "block": block_identifier,
+                "checked_token_count": len(token_ids),
+                "positive_balance_count": 0,
+                "total_token_units": 0,
+                "tokens": [],
+                "error": compact_error(exc),
+                "elapsed_ms": round((time.monotonic() - wallet_started) * 1000),
+                "timestamp": int(time.time()),
+            }
 
     write_metadata = args.format == "jsonl" and (not output_path.exists() or output_path.stat().st_size == 0)
     with ResultWriter(
@@ -805,74 +1017,43 @@ def process(args: argparse.Namespace) -> None:
         metadata=metadata,
         write_metadata=write_metadata,
     ) as writer:
-        for index, wallet in enumerate(wallets_to_scan, 1):
-            wallet_started = time.monotonic()
-            try:
-                tokens = scan_wallet(
-                    pool,
-                    contract_address,
-                    abi,
-                    wallet,
-                    token_ids,
-                    block_identifier,
-                    chunk_size=args.chunk_size,
-                    no_batch=args.no_batch,
-                )
-                successful += 1
-                units = sum(balance for _, balance in tokens)
-                if tokens:
-                    wallets_with_tokens += 1
-                    positive_token_ids += len(tokens)
-                    total_token_units += units
-                result = {
-                    "wallet": wallet,
-                    "ok": True,
-                    "scan_id": scan_id,
-                    "contract": contract_address,
-                    "chain_id": effective_chain_id,
-                    "block": block_identifier,
-                    "checked_token_count": len(token_ids),
-                    "positive_balance_count": len(tokens),
-                    "total_token_units": units,
-                    "tokens": [
-                        {"token_id": token_id, "balance": balance}
-                        for token_id, balance in tokens
-                    ],
-                    "elapsed_ms": round((time.monotonic() - wallet_started) * 1000),
-                    "timestamp": int(time.time()),
-                }
-            except Exception as exc:
-                failed += 1
-                LOG.error("Wallet failed: %s | %s", wallet, compact_error(exc))
-                result = {
-                    "wallet": wallet,
-                    "ok": False,
-                    "scan_id": scan_id,
-                    "contract": contract_address,
-                    "chain_id": effective_chain_id,
-                    "block": block_identifier,
-                    "checked_token_count": len(token_ids),
-                    "positive_balance_count": 0,
-                    "total_token_units": 0,
-                    "tokens": [],
-                    "error": compact_error(exc),
-                    "elapsed_ms": round((time.monotonic() - wallet_started) * 1000),
-                    "timestamp": int(time.time()),
-                }
-                if args.fail_fast:
-                    writer.write(result)
-                    raise
+        if args.workers == 1:
+            result_iter = map(scan_one, wallets_to_scan)
+            executor = None
+        else:
+            executor = ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix="wallet-scan")
+            result_iter = executor.map(scan_one, wallets_to_scan)
 
-            writer.write(result)
-            LOG.info(
-                "Progress %s/%s | %s | positive_ids=%s units=%s | %.2fs",
-                index,
-                len(wallets_to_scan),
-                wallet,
-                result.get("positive_balance_count", 0),
-                result.get("total_token_units", 0),
-                time.monotonic() - wallet_started,
-            )
+        try:
+            for index, result in enumerate(result_iter, 1):
+                writer.write(result)
+
+                if result["ok"]:
+                    successful += 1
+                    if result["positive_balance_count"] > 0:
+                        wallets_with_tokens += 1
+                        positive_token_ids += int(result["positive_balance_count"])
+                        total_token_units += int(result["total_token_units"])
+                else:
+                    failed += 1
+                    if args.fail_fast:
+                        raise RuntimeError(
+                            f"Wallet failed: {result['wallet']}: {result.get('error', 'unknown error')}"
+                        )
+
+                LOG.info(
+                    "Progress %s/%s | %s | positive_ids=%s units=%s | %sms | batch_limit=%s",
+                    index,
+                    len(wallets_to_scan),
+                    result["wallet"],
+                    result.get("positive_balance_count", 0),
+                    result.get("total_token_units", 0),
+                    result.get("elapsed_ms", 0),
+                    batch_sizer.get(),
+                )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
     LOG.info(
         "Completed | success=%s failed=%s skipped_resume=%s wallets_with_tokens=%s "
@@ -925,6 +1106,12 @@ def parse_args() -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=int(os.getenv("CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE))),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.getenv("WORKERS", str(DEFAULT_WORKERS))),
+        help="Wallets scanned concurrently (default: %(default)s)",
     )
     parser.add_argument(
         "--retries",

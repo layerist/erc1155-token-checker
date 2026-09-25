@@ -33,7 +33,7 @@ import random
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
@@ -55,6 +55,7 @@ DEFAULT_TIMEOUT = 20
 DEFAULT_RPC_COOLDOWN = 2.0
 DEFAULT_WORKERS = 4
 MAX_RPC_COOLDOWN = 30.0
+MAX_UINT256 = (1 << 256) - 1
 JSONL_SCHEMA = 2
 ERC1155_INTERFACE_ID = "0xd9b67a26"
 
@@ -373,6 +374,8 @@ def normalize_token_ids(values: Iterable[int]) -> list[int]:
         token_id = int(raw)
         if token_id < 0:
             raise ValueError(f"Token ID cannot be negative: {token_id}")
+        if token_id > MAX_UINT256:
+            raise ValueError(f"Token ID exceeds uint256 range: {token_id}")
         if token_id not in seen:
             seen.add(token_id)
             result.append(token_id)
@@ -851,6 +854,34 @@ def resolve_block(
     return block
 
 
+
+def bounded_executor_map(
+    executor: ThreadPoolExecutor,
+    fn: Callable[[T], Any],
+    items: Iterable[T],
+    *,
+    max_pending: int,
+) -> Iterator[Any]:
+    """Map without eagerly submitting an arbitrarily large wallet list."""
+    iterator = iter(items)
+    pending: set[Future[Any]] = set()
+    limit = max(1, max_pending)
+
+    def fill() -> None:
+        while len(pending) < limit:
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            pending.add(executor.submit(fn, item))
+
+    fill()
+    while pending:
+        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for future in done:
+            yield future.result()
+        fill()
+
 def process(args: argparse.Namespace) -> None:
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be greater than zero")
@@ -1022,7 +1053,12 @@ def process(args: argparse.Namespace) -> None:
             executor = None
         else:
             executor = ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix="wallet-scan")
-            result_iter = executor.map(scan_one, wallets_to_scan)
+            result_iter = bounded_executor_map(
+                executor,
+                scan_one,
+                wallets_to_scan,
+                max_pending=max(args.workers, args.workers * 2),
+            )
 
         try:
             for index, result in enumerate(result_iter, 1):

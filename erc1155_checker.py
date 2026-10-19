@@ -17,7 +17,7 @@ Improvements over the previous version:
 - Adaptive batch-size learning across wallets
 - Cached contract objects per RPC endpoint
 - Fast abort of deterministic RPC errors before pointless failover retries
-- Read-only eth_call / eth_getCode requests only
+- Read-only RPC queries only; no transactions or signing
 
 The script never needs private keys and never sends transactions.
 """
@@ -28,8 +28,11 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import random
+import re
+import shutil
 import sys
 import time
 import threading
@@ -37,6 +40,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from web3 import Web3
@@ -57,7 +61,7 @@ DEFAULT_WORKERS = 4
 MAX_RPC_COOLDOWN = 30.0
 MAX_UINT256 = (1 << 256) - 1
 JSONL_SCHEMA = 2
-ERC1155_INTERFACE_ID = "0xd9b67a26"
+HTTP_URL_PATTERN = re.compile(r"https?://[^\s\'\"<>]+", re.IGNORECASE)
 
 MINIMAL_ERC1155_ABI: list[dict[str, Any]] = [
     {
@@ -115,13 +119,14 @@ class RpcPool:
         self.retry_sleep = retry_sleep
         self.cooldown_base = cooldown_base
         self._endpoints: list[RpcEndpoint] = []
+        self._endpoint_by_web3_id: dict[int, RpcEndpoint] = {}
         self._index = 0
         self._lock = threading.Lock()
 
         for url in unique_preserving_order(urls):
-            provider = Web3.HTTPProvider(url, request_kwargs={"timeout": timeout})
-            w3 = Web3(provider)
             try:
+                provider = Web3.HTTPProvider(url, request_kwargs={"timeout": timeout})
+                w3 = Web3(provider)
                 if not is_connected(w3):
                     raise ConnectionError("is_connected returned false")
                 chain_id = int(w3.eth.chain_id)
@@ -130,9 +135,9 @@ class RpcPool:
                         f"unexpected chain ID {chain_id}, expected {expected_chain_id}"
                     )
                 block = int(w3.eth.block_number)
-                self._endpoints.append(
-                    RpcEndpoint(url=url, w3=w3, chain_id=chain_id, contracts={})
-                )
+                endpoint = RpcEndpoint(url=url, w3=w3, chain_id=chain_id, contracts={})
+                self._endpoints.append(endpoint)
+                self._endpoint_by_web3_id[id(w3)] = endpoint
                 LOG.info(
                     "RPC ready: %s | chain=%s | block=%s",
                     redact_url(url),
@@ -234,13 +239,14 @@ class RpcPool:
         raise RuntimeError(f"{description} failed: {compact_error(last_error)}") from last_error
 
     def get_contract(self, w3: Web3, address: str, abi: list[dict[str, Any]]):
-        endpoint = next((e for e in self._endpoints if e.w3 is w3), None)
+        endpoint = self._endpoint_by_web3_id.get(id(w3))
         if endpoint is None:
             return w3.eth.contract(address=address, abi=abi)
 
         key = address.lower()
         with self._lock:
-            assert endpoint.contracts is not None
+            if endpoint.contracts is None:
+                endpoint.contracts = {}
             contract = endpoint.contracts.get(key)
             if contract is None:
                 contract = w3.eth.contract(address=address, abi=abi)
@@ -298,23 +304,40 @@ def validate_address(value: str, label: str) -> str:
 
 
 def redact_url(url: str) -> str:
-    if "?" in url:
-        return url.split("?", 1)[0] + "?…"
-    parts = url.rsplit("/", 1)
-    if len(parts) == 2 and len(parts[1]) > 24:
-        return parts[0] + "/…"
-    return url
+    """Log RPC endpoint identity without credentials, API keys, or query strings."""
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return "<invalid RPC URL>"
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        suffix = "/…" if parsed.path not in {"", "/"} else "/"
+        if parsed.query or parsed.fragment:
+            suffix += "?…"
+        return f"{parsed.scheme}://{host}{port}{suffix}"
+    except ValueError:
+        return "<invalid RPC URL>"
 
 
 def compact_error(exc: BaseException | None) -> str:
     if exc is None:
         return "unknown error"
     text = " ".join(str(exc).split())
+    # Exception messages from HTTP clients frequently include full authenticated URLs.
+    text = HTTP_URL_PATTERN.sub(lambda match: redact_url(match.group(0)), text)
     return text[:500]
+
+
+class InvalidBatchResponse(ValueError):
+    """The contract returned a malformed balanceOfBatch result."""
 
 
 def is_retryable_rpc_error(exc: BaseException) -> bool:
     """Return False for errors that another RPC retry is very unlikely to fix."""
+    if isinstance(exc, InvalidBatchResponse):
+        return False
     text = compact_error(exc).lower()
     deterministic_markers = (
         "execution reverted",
@@ -343,7 +366,7 @@ class AdaptiveBatchSizer:
             return self._limit
 
     def reduce_after_failure(self, failed_size: int) -> int:
-        candidate = max(1, failed_size // 2)
+        candidate = max(1, (failed_size + 1) // 2)
         with self._lock:
             if candidate < self._limit:
                 old = self._limit
@@ -389,15 +412,16 @@ def parse_token_file(path_value: str | None) -> list[int]:
     if not path.is_file():
         raise FileNotFoundError(f"Token file not found: {path}")
     values: list[int] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        clean = line.split("#", 1)[0].strip()
-        if not clean:
-            continue
-        for part in clean.replace(",", " ").split():
-            try:
-                values.append(int(part, 0))
-            except ValueError as exc:
-                raise ValueError(f"Invalid token ID at {path}:{line_number}: {part!r}") from exc
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            clean = line.split("#", 1)[0].strip()
+            if not clean:
+                continue
+            for part in clean.replace(",", " ").split():
+                try:
+                    values.append(int(part, 10 if re.fullmatch(r"[+-]?[0-9]+", part) else 0))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid token ID at {path}:{line_number}: {part!r}") from exc
     return values
 
 
@@ -416,14 +440,24 @@ def load_abi(path_value: str | None) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         raise ValueError("ABI must be a JSON list or an object containing an 'abi' list")
 
-    function_names = {
-        item.get("name")
-        for item in data
-        if isinstance(item, dict) and item.get("type") == "function"
+    required = {
+        "balanceOf": (["address", "uint256"], ["uint256"]),
+        "balanceOfBatch": (["address[]", "uint256[]"], ["uint256[]"]),
     }
-    missing = {"balanceOf", "balanceOfBatch"} - function_names
-    if missing:
-        raise ValueError(f"ABI is missing required ERC-1155 function(s): {', '.join(sorted(missing))}")
+    for name, (inputs, outputs) in required.items():
+        if not any(
+            isinstance(item, dict)
+            and item.get("type") == "function"
+            and item.get("name") == name
+            and isinstance(item.get("inputs"), list)
+            and all(isinstance(arg, dict) for arg in item["inputs"])
+            and [arg.get("type") for arg in item["inputs"]] == inputs
+            and isinstance(item.get("outputs"), list)
+            and all(isinstance(arg, dict) for arg in item["outputs"])
+            and [arg.get("type") for arg in item["outputs"]] == outputs
+            for item in data
+        ):
+            raise ValueError(f"ABI is missing the expected ERC-1155 signature for {name}")
     return data
 
 
@@ -436,24 +470,25 @@ def read_wallets(path_value: str, *, strict: bool) -> tuple[list[str], list[dict
     errors: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        clean = line.split("#", 1)[0].strip()
-        if not clean:
-            continue
-        raw = clean.replace(",", " ").split()[0]
-        try:
-            wallet = validate_address(raw, "wallet address")
-        except ValueError as exc:
-            item = {"line": line_number, "value": raw, "error": str(exc)}
-            errors.append(item)
-            if strict:
-                raise ValueError(f"Invalid wallet at {path}:{line_number}: {raw!r}") from exc
-            LOG.warning("Skipping invalid wallet at line %s: %s", line_number, raw)
-            continue
-        key = wallet.lower()
-        if key not in seen:
-            seen.add(key)
-            wallets.append(wallet)
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            clean = line.split("#", 1)[0].strip()
+            if not clean:
+                continue
+            raw = clean.replace(",", " ").split()[0]
+            try:
+                wallet = validate_address(raw, "wallet address")
+            except ValueError as exc:
+                item = {"line": line_number, "value": raw, "error": str(exc)}
+                errors.append(item)
+                if strict:
+                    raise ValueError(f"Invalid wallet at {path}:{line_number}: {raw!r}") from exc
+                LOG.warning("Skipping invalid wallet at line %s: %s", line_number, raw)
+                continue
+            key = wallet.lower()
+            if key not in seen:
+                seen.add(key)
+                wallets.append(wallet)
 
     return wallets, errors
 
@@ -485,20 +520,36 @@ def repair_truncated_jsonl_tail(path: Path) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
 
-    data = path.read_bytes()
-    if data.endswith(b"\n"):
-        return False
+    with path.open("rb") as handle:
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return False
 
-    last_newline = data.rfind(b"\n")
-    tail = data[last_newline + 1 :]
+        size = handle.tell()
+        # Scan backwards in blocks to avoid loading the full history into memory.
+        cursor = size
+        last_newline = -1
+        while cursor > 0:
+            start = max(0, cursor - 65536)
+            handle.seek(start)
+            chunk = handle.read(cursor - start)
+            offset = chunk.rfind(b"\n")
+            if offset >= 0:
+                last_newline = start + offset
+                break
+            cursor = start
+
+        handle.seek(last_newline + 1)
+        tail = handle.read()
+
     try:
         json.loads(tail.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        keep = data[: last_newline + 1] if last_newline >= 0 else b""
         backup = path.with_suffix(path.suffix + ".truncated")
         if not backup.exists():
-            backup.write_bytes(data)
-        path.write_bytes(keep)
+            shutil.copyfile(path, backup)
+        with path.open("r+b") as handle:
+            handle.truncate(last_newline + 1)
         LOG.warning(
             "Removed a truncated final JSONL record from %s; original saved as %s",
             path,
@@ -506,7 +557,7 @@ def repair_truncated_jsonl_tail(path: Path) -> bool:
         )
         return True
 
-    # Valid final JSON object, merely missing the line terminator.
+    # Valid final JSON value, merely missing its line terminator.
     with path.open("ab") as handle:
         handle.write(b"\n")
     return True
@@ -518,37 +569,57 @@ def load_resume_state(path: Path) -> ResumeState:
 
     completed: set[str] = set()
     metadata: dict[str, Any] | None = None
-
-    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Malformed JSONL at {path}:{line_number}; refusing unsafe resume"
-            ) from exc
-
-        if isinstance(item, dict) and isinstance(item.get("_meta"), dict):
-            if metadata is None:
-                metadata = item["_meta"]
-            continue
-
-        if not isinstance(item, dict):
-            continue
-
-        if metadata is not None and "scan_id" in item:
-            row_scan_id = item.get("scan_id")
-            meta_scan_id = metadata.get("scan_id")
-            if row_scan_id != meta_scan_id:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
                 raise ValueError(
-                    f"JSONL row {line_number} belongs to scan_id={row_scan_id!r}, "
-                    f"but metadata declares scan_id={meta_scan_id!r}"
-                )
+                    f"Malformed JSONL at {path}:{line_number}; refusing unsafe resume"
+                ) from exc
 
-        wallet = item.get("wallet")
-        if isinstance(wallet, str) and item.get("ok") is True:
-            completed.add(wallet.lower())
+            if not isinstance(item, dict):
+                raise ValueError(f"Unexpected JSONL value at {path}:{line_number}")
+
+            if "_meta" in item:
+                new_metadata = item["_meta"]
+                if not isinstance(new_metadata, dict):
+                    raise ValueError(f"Invalid scan metadata at {path}:{line_number}")
+                if metadata is None:
+                    if completed:
+                        raise ValueError(f"Scan metadata must precede wallet rows in {path}")
+                    metadata = new_metadata
+                elif new_metadata != metadata:
+                    raise ValueError(f"Conflicting scan metadata at {path}:{line_number}")
+                continue
+
+            if metadata is None:
+                raise ValueError(f"Wallet row precedes scan metadata at {path}:{line_number}")
+
+            # A success must not be skipped if its record came from another block
+            # or was partially/incorrectly assembled in a previous run.
+            required = {
+                "scan_id": metadata.get("scan_id"),
+                "contract": metadata.get("contract"),
+                "chain_id": metadata.get("chain_id"),
+                "block": metadata.get("block"),
+                "checked_token_count": metadata.get("token_count"),
+            }
+            if any(
+                item.get(key) != value
+                for key, value in required.items()
+            ):
+                raise ValueError(f"Wallet row metadata mismatch at {path}:{line_number}")
+
+            wallet = item.get("wallet")
+            if not isinstance(wallet, str) or not is_address(wallet):
+                raise ValueError(f"Invalid wallet in JSONL at {path}:{line_number}")
+            if not isinstance(item.get("ok"), bool):
+                raise ValueError(f"Invalid wallet status in JSONL at {path}:{line_number}")
+            if item["ok"]:
+                completed.add(wallet.lower())
 
     return ResumeState(completed_wallets=completed, metadata=metadata)
 
@@ -668,7 +739,7 @@ def fetch_batch(
             block_identifier=block_identifier
         )
         if len(values) != len(token_ids):
-            raise ValueError(
+            raise InvalidBatchResponse(
                 f"balanceOfBatch returned {len(values)} values for {len(token_ids)} IDs"
             )
         return [int(value) for value in values]
@@ -839,7 +910,7 @@ def resolve_block(
         return pool.call(lambda w3: int(w3.eth.block_number), "get snapshot block")
 
     try:
-        block = int(args.block, 0)
+        block = int(args.block, 10 if re.fullmatch(r"[+]?[0-9]+", args.block) else 0)
     except ValueError as exc:
         raise ValueError("--block must be 'snapshot', 'latest', or an integer") from exc
     if block < 0:
@@ -887,14 +958,16 @@ def process(args: argparse.Namespace) -> None:
         raise ValueError("--chunk-size must be greater than zero")
     if args.retries <= 0:
         raise ValueError("--retries must be greater than zero")
-    if args.retry_sleep < 0:
-        raise ValueError("--retry-sleep cannot be negative")
+    if not math.isfinite(args.retry_sleep) or args.retry_sleep < 0:
+        raise ValueError("--retry-sleep must be finite and nonnegative")
     if args.request_timeout <= 0:
         raise ValueError("--request-timeout must be greater than zero")
-    if args.rpc_cooldown < 0:
-        raise ValueError("--rpc-cooldown cannot be negative")
+    if not math.isfinite(args.rpc_cooldown) or args.rpc_cooldown < 0:
+        raise ValueError("--rpc-cooldown must be finite and nonnegative")
     if args.workers <= 0:
         raise ValueError("--workers must be greater than zero")
+    if args.chain_id < -1:
+        raise ValueError("--chain-id must be -1 or a nonnegative integer")
 
     contract_address = validate_address(args.contract, "contract address")
     token_ids = normalize_token_ids((args.tokens or []) + parse_token_file(args.token_file))
@@ -905,9 +978,22 @@ def process(args: argparse.Namespace) -> None:
     wallets, invalid_wallets = read_wallets(args.wallets, strict=args.strict_wallets)
     if not wallets:
         raise ValueError("No valid wallet addresses found")
+    output_path = Path(args.output)
+    input_paths = [Path(args.wallets)]
+    if args.token_file:
+        input_paths.append(Path(args.token_file))
+    if args.abi:
+        input_paths.append(Path(args.abi))
+    if any(output_path.resolve() == source.resolve() for source in input_paths):
+        raise ValueError("--output must not overwrite a wallet, token, or ABI input file")
+    if args.invalid_wallets_output:
+        report_path = Path(args.invalid_wallets_output)
+        if report_path.resolve() == output_path.resolve() or any(
+            report_path.resolve() == source.resolve() for source in input_paths
+        ):
+            raise ValueError("--invalid-wallets-output must be distinct from input and output files")
     write_invalid_wallets(args.invalid_wallets_output, invalid_wallets)
 
-    output_path = Path(args.output)
     if args.clear_output:
         output_path.unlink(missing_ok=True)
     if args.resume and args.format != "jsonl":
@@ -969,6 +1055,7 @@ def process(args: argparse.Namespace) -> None:
 
     completed = resume_state.completed_wallets if args.resume else set()
     wallets_to_scan = [wallet for wallet in wallets if wallet.lower() not in completed]
+    skipped_resume = len(wallets) - len(wallets_to_scan)
 
     LOG.info(
         "Scan start | wallets=%s pending=%s tokens=%s chunk=%s workers=%s block=%s invalid_wallets=%s scan_id=%s",
@@ -1096,7 +1183,7 @@ def process(args: argparse.Namespace) -> None:
         "positive_token_ids=%s total_token_units=%s elapsed=%.2fs",
         successful,
         failed,
-        len(completed),
+        skipped_resume,
         wallets_with_tokens,
         positive_token_ids,
         total_token_units,
@@ -1131,7 +1218,7 @@ def parse_args() -> argparse.Namespace:
         "--chain-id",
         type=int,
         default=int(os.getenv("CHAIN_ID", str(DEFAULT_CHAIN_ID))),
-        help="Expected chain ID; use -1 to auto-detect/disable explicit validation",
+        help="Expected chain ID; use -1 to auto-detect (RPC endpoints must still agree)",
     )
     parser.add_argument(
         "--block",
